@@ -45,7 +45,7 @@ services:
     restart: unless-stopped
 
   # MinIO S3-compatible storage
-  minio:
+  cooly-minio-prod:
     image: minio/minio:latest
     container_name: cooly-minio-prod
     command: server /data --console-address ":9001"
@@ -69,7 +69,7 @@ services:
     image: minio/mc:latest
     container_name: cooly-minio-init-prod
     depends_on:
-      minio:
+      cooly-minio-prod:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
@@ -83,7 +83,7 @@ services:
       - cooly-network
 
   # Backend API + Worker
-  backend:
+  cooly-backend-prod:
     build:
       context: .
       dockerfile: backend/Dockerfile
@@ -196,7 +196,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      minio:
+      cooly-minio-prod:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
@@ -212,7 +212,7 @@ services:
     restart: unless-stopped
 
   # Frontend (Next.js)
-  frontend:
+  cooly-frontend-prod:
     build:
       context: .
       dockerfile: frontend/Dockerfile
@@ -235,7 +235,7 @@ services:
       NEXT_PUBLIC_DEBUG_LOGS: ${NEXT_PUBLIC_DEBUG_LOGS:-false}
       NEXT_PUBLIC_SORA2_HIDE_PRO: ${NEXT_PUBLIC_SORA2_HIDE_PRO:-true}
     depends_on:
-      backend:
+      cooly-backend-prod:
         condition: service_healthy
     networks:
       - cooly-network
