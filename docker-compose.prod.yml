@@ -120,7 +120,7 @@ services:
       # Frontend URL for CORS
       FRONTEND_URL: https://${DOMAIN}
       ALLOWED_ORIGINS: https://${DOMAIN},https://www.${DOMAIN}
-      COOKIE_DOMAIN: ${DOMAIN}
+      COOKIE_DOMAIN: thetasai.cloud
 
       # JWT & Security
       JWT_SECRET: ${JWT_SECRET}
