@@ -221,6 +221,7 @@ services:
         NEXT_PUBLIC_MOCK_API: "false"
         NODE_ENV: production
     container_name: cooly-frontend-prod
+    command: ["sh", "-c", "HOSTNAME=0.0.0.0 node server.js"]
     environment:
       NODE_ENV: production
       PORT: 3000
