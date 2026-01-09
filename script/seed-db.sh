@@ -96,17 +96,35 @@ VALUES
   ('gen_worker_concurrency', '5')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
 
--- Display created user
-SELECT id, email, created_at FROM users WHERE email = '$TEST_USER_EMAIL';
+-- Create admin user if ADMIN_EMAIL and ADMIN_PASSWORD are set
+DO \$\$
+DECLARE
+  admin_user_id UUID;
+  admin_email TEXT := COALESCE(NULLIF(current_setting('app.admin_email', true), ''), 'admin@cooly.ai');
+  admin_pass_hash TEXT := '\$2b\$12\$aOBTYPdoUdrbI0VwJi9pI.tJJ9PtbpQ4EpJUDhgEofm8zAJdAtMiS'; -- default: testpassword123
+BEGIN
+  SELECT id INTO admin_user_id FROM users WHERE email = admin_email;
+
+  IF admin_user_id IS NULL THEN
+    INSERT INTO users (email, password_hash, role)
+    VALUES (admin_email, admin_pass_hash, 'admin')
+    RETURNING id INTO admin_user_id;
+    RAISE NOTICE 'Created admin user: %', admin_email;
+  ELSE
+    UPDATE users SET role = 'admin' WHERE id = admin_user_id AND role != 'admin';
+    RAISE NOTICE 'Admin user already exists: %', admin_email;
+  END IF;
+END \$\$;
+
+-- Display created users
+SELECT id, email, role, credits, created_at FROM users ORDER BY created_at;
 
 -- Display credit balance
-SELECT u.email, SUM(cl.remaining) as total_credits
+SELECT u.email, u.credits as cached_credits, COALESCE(SUM(cl.remaining), 0) as lot_credits
 FROM users u
-JOIN credit_lots cl ON cl.user_id = u.id
-WHERE u.email = '$TEST_USER_EMAIL'
-  AND cl.expires_at > NOW()
-  AND cl.closed_at IS NULL
-GROUP BY u.email;
+LEFT JOIN credit_lots cl ON cl.user_id = u.id AND cl.expires_at > NOW() AND cl.closed_at IS NULL
+GROUP BY u.id, u.email, u.credits
+ORDER BY u.email;
 EOSQL
 
 echo "=========================================="

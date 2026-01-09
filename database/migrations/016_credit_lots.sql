@@ -1,25 +1,48 @@
 -- 016_credit_lots.sql
 -- Introduce per-lot credit tracking with expiries
 
-create table if not exists public.credit_lots (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.users(id) on delete cascade,
-  source text not null check (source in ('subscription','one_off','adjustment')),
-  plan_key text null,
-  cycle_start timestamptz null,
-  amount integer not null check (amount >= 0),
-  remaining integer not null check (remaining >= 0),
-  expires_at timestamptz not null,
-  created_at timestamptz not null default now(),
-  closed_at timestamptz null
+-- Create credit_lots table
+CREATE TABLE IF NOT EXISTS public.credit_lots (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  source text NOT NULL CHECK (source IN ('subscription','one_off','adjustment')),
+  plan_key text NULL,
+  cycle_start timestamptz NULL,
+  amount integer NOT NULL CHECK (amount >= 0),
+  remaining integer NOT NULL CHECK (remaining >= 0),
+  expires_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  closed_at timestamptz NULL
 );
 
-create index if not exists idx_credit_lots_user_expires on public.credit_lots(user_id, expires_at) where closed_at is null;
-create index if not exists idx_credit_lots_user_remaining on public.credit_lots(user_id) where remaining > 0 and closed_at is null;
+CREATE INDEX IF NOT EXISTS idx_credit_lots_user_expires ON public.credit_lots(user_id, expires_at) WHERE closed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_credit_lots_user_remaining ON public.credit_lots(user_id) WHERE remaining > 0 AND closed_at IS NULL;
 
--- Optional link from transactions to lots for audit
-alter table if exists public.credit_transactions
-  add column if not exists lot_id uuid null references public.credit_lots(id),
-  add column if not exists expires_at timestamptz null;
+-- Add lot_id column to credit_transactions (separate statement for reliability)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+        AND table_name = 'credit_transactions'
+        AND column_name = 'lot_id'
+    ) THEN
+        ALTER TABLE public.credit_transactions ADD COLUMN lot_id uuid REFERENCES public.credit_lots(id);
+    END IF;
+END $$;
 
+-- Add expires_at column to credit_transactions
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+        AND table_name = 'credit_transactions'
+        AND column_name = 'expires_at'
+    ) THEN
+        ALTER TABLE public.credit_transactions ADD COLUMN expires_at timestamptz;
+    END IF;
+END $$;
 
+-- Add index for lot_id lookups
+CREATE INDEX IF NOT EXISTS idx_credit_transactions_lot_id ON public.credit_transactions(lot_id) WHERE lot_id IS NOT NULL;
