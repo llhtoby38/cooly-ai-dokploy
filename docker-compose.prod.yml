@@ -61,10 +61,12 @@ services:
       retries: 5
     networks:
       - cooly-network
+      - dokploy-network
     restart: unless-stopped
     labels:
       # Traefik routing for MinIO API (internal only, no external access needed)
       - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
       - "traefik.http.routers.minio-api.rule=Host(`${MINIO_DOMAIN:-minio.${DOMAIN}}`)"
       - "traefik.http.routers.minio-api.entrypoints=websecure"
       - "traefik.http.routers.minio-api.tls.certresolver=letsencrypt"
@@ -221,10 +223,12 @@ services:
       start_period: 60s
     networks:
       - cooly-network
+      - dokploy-network
     restart: unless-stopped
     labels:
       # Traefik routing for Backend API
       - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
       - "traefik.http.routers.backend.rule=Host(`${API_DOMAIN:-api.${DOMAIN}}`)"
       - "traefik.http.routers.backend.entrypoints=websecure"
       - "traefik.http.routers.backend.tls.certresolver=letsencrypt"
@@ -258,10 +262,12 @@ services:
         condition: service_healthy
     networks:
       - cooly-network
+      - dokploy-network
     restart: unless-stopped
     labels:
       # Traefik routing for Frontend
       - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
       - "traefik.http.routers.frontend.rule=Host(`${DOMAIN}`) || Host(`www.${DOMAIN}`)"
       - "traefik.http.routers.frontend.entrypoints=websecure"
       - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
@@ -283,3 +289,5 @@ volumes:
 networks:
   cooly-network:
     driver: bridge
+  dokploy-network:
+    external: true
