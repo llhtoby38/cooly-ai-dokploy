@@ -110,14 +110,12 @@ services:
       ENABLE_CAPTURE_WORKER: "true"
       ENABLE_SESSION_SWEEPER: "true"
 
-      # Storage (MinIO)
-      S3_ENDPOINT: http://minio:9000
-      S3_PUBLIC_URL: https://${MINIO_DOMAIN:-minio.${DOMAIN}}
-      S3_FORCE_PATH_STYLE: "true"
-      B2_BUCKET_NAME: ${S3_BUCKET_NAME}
-      B2_REGION: us-east-1
-      B2_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      B2_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # Storage (Backblaze B2) - No S3_ENDPOINT means use B2
+      B2_BUCKET_NAME: ${B2_BUCKET_NAME}
+      B2_REGION: ${B2_REGION:-us-east-005}
+      B2_ACCESS_KEY_ID: ${B2_ACCESS_KEY_ID}
+      B2_SECRET_ACCESS_KEY: ${B2_SECRET_ACCESS_KEY}
+      B2_ENDPOINT: ${B2_ENDPOINT:-https://s3.us-east-005.backblazeb2.com}
 
       # Frontend URL for CORS
       FRONTEND_URL: https://${DOMAIN}
