@@ -63,21 +63,6 @@ services:
       - cooly-network
       - dokploy-network
     restart: unless-stopped
-    labels:
-      # Traefik routing for MinIO API (internal only, no external access needed)
-      - "traefik.enable=true"
-      - "traefik.docker.network=dokploy-network"
-      - "traefik.http.routers.minio-api.rule=Host(`${MINIO_DOMAIN:-minio.${DOMAIN}}`)"
-      - "traefik.http.routers.minio-api.entrypoints=websecure"
-      - "traefik.http.routers.minio-api.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.minio-api.service=minio-api"
-      - "traefik.http.services.minio-api.loadbalancer.server.port=9000"
-      # Traefik routing for MinIO Console (admin access)
-      - "traefik.http.routers.minio-console.rule=Host(`${MINIO_CONSOLE_DOMAIN:-minio-console.${DOMAIN}}`)"
-      - "traefik.http.routers.minio-console.entrypoints=websecure"
-      - "traefik.http.routers.minio-console.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.minio-console.service=minio-console"
-      - "traefik.http.services.minio-console.loadbalancer.server.port=9001"
 
   # MinIO bucket initialization
   minio-init:
@@ -225,14 +210,6 @@ services:
       - cooly-network
       - dokploy-network
     restart: unless-stopped
-    labels:
-      # Traefik routing for Backend API
-      - "traefik.enable=true"
-      - "traefik.docker.network=dokploy-network"
-      - "traefik.http.routers.backend.rule=Host(`${API_DOMAIN:-api.${DOMAIN}}`)"
-      - "traefik.http.routers.backend.entrypoints=websecure"
-      - "traefik.http.routers.backend.tls.certresolver=letsencrypt"
-      - "traefik.http.services.backend.loadbalancer.server.port=5000"
 
   # Frontend (Next.js)
   frontend:
@@ -264,19 +241,6 @@ services:
       - cooly-network
       - dokploy-network
     restart: unless-stopped
-    labels:
-      # Traefik routing for Frontend
-      - "traefik.enable=true"
-      - "traefik.docker.network=dokploy-network"
-      - "traefik.http.routers.frontend.rule=Host(`${DOMAIN}`) || Host(`www.${DOMAIN}`)"
-      - "traefik.http.routers.frontend.entrypoints=websecure"
-      - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
-      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
-      # Redirect www to non-www
-      - "traefik.http.middlewares.redirect-www.redirectregex.regex=^https://www\\.(.+)"
-      - "traefik.http.middlewares.redirect-www.redirectregex.replacement=https://$${1}"
-      - "traefik.http.middlewares.redirect-www.redirectregex.permanent=true"
-      - "traefik.http.routers.frontend.middlewares=redirect-www"
 
 volumes:
   postgres_data:
