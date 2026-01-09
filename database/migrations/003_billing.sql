@@ -28,6 +28,20 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     stripe_subscription_id TEXT NOT NULL UNIQUE,
     status TEXT NOT NULL,
     plan_id TEXT NOT NULL,
+    billing_mode TEXT,
     current_period_end TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- Add billing_mode column if table already exists (for existing deployments)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+        AND table_name = 'subscriptions'
+        AND column_name = 'billing_mode'
+    ) THEN
+        ALTER TABLE public.subscriptions ADD COLUMN billing_mode TEXT;
+    END IF;
+END $$;
