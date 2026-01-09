@@ -3,10 +3,10 @@ FROM node:20-alpine AS deps
 WORKDIR /app
 
 # Copy package files
-COPY backend/package*.json ./
+COPY backend/package.json backend/package-lock.json ./
 
 # Install all dependencies (including dev for build)
-RUN npm ci
+RUN npm ci --verbose && ls -la /app/node_modules
 
 # Stage 2: Builder
 FROM node:20-alpine AS builder

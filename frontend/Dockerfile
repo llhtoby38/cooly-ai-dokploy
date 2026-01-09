@@ -3,10 +3,10 @@ FROM node:20-alpine AS deps
 WORKDIR /app
 
 # Copy package files
-COPY frontend/package*.json ./
+COPY frontend/package.json frontend/package-lock.json ./
 
-# Install dependencies
-RUN npm ci
+# Install dependencies with verbose output
+RUN npm ci --verbose && ls -la /app/node_modules
 
 # Stage 2: Builder
 FROM node:20-alpine AS builder
@@ -28,9 +28,6 @@ COPY --from=deps /app/node_modules ./node_modules
 
 # Copy frontend source
 COPY frontend/ ./
-
-# Copy root .env for any shared config (optional, may not exist)
-COPY .env* ./
 
 # Build the application
 # Remove prebuild script since NEXT_PUBLIC_API_BASE is set via build args
