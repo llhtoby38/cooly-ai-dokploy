@@ -1,10 +1,9 @@
-version: '3.9'
-
 # ============================================================
 # Cooly AI - Production Deployment (Dokploy/VM)
 # ============================================================
 # This compose file is optimized for deployment on Dokploy
 # with Traefik reverse proxy for SSL/domain management
+# Environment variables are injected by Dokploy
 # ============================================================
 
 services:
@@ -139,8 +138,72 @@ services:
       # JWT & Security
       JWT_SECRET: ${JWT_SECRET}
       ADMIN_SECRET_KEY: ${ADMIN_SECRET_KEY}
-    env_file:
-      - .env.prod
+      EXCHANGE_JWT_SECRET: ${EXCHANGE_JWT_SECRET}
+
+      # API Provider Keys (injected by Dokploy)
+      BYTEPLUS_APP_ID: ${BYTEPLUS_APP_ID}
+      BYTEPLUS_ACCESS_TOKEN: ${BYTEPLUS_ACCESS_TOKEN}
+      BYTEPLUS_SECRET_KEY: ${BYTEPLUS_SECRET_KEY}
+      BYTEPLUS_ARK_API_KEY: ${BYTEPLUS_ARK_API_KEY}
+      SEEDREAM4_API_KEY: ${SEEDREAM4_API_KEY}
+      SEEDREAM4_MODEL_ID: ${SEEDREAM4_MODEL_ID:-seedream-4-0-250828}
+      SEEDREAM4_API_BASE: ${SEEDREAM4_API_BASE:-https://ark.ap-southeast.bytepluses.com}
+      SEEDANCE_API_BASE: ${SEEDANCE_API_BASE:-https://ark.ap-southeast.bytepluses.com}
+      SEEDANCE_API_KEY: ${SEEDANCE_API_KEY}
+      SEEDANCE_ENDPOINT_ID: ${SEEDANCE_ENDPOINT_ID}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.openai.com/v1}
+      SORA_PROVIDER: ${SORA_PROVIDER:-wavespeed}
+      FAL_KEY: ${FAL_KEY}
+      WAVESPEED_API_KEY: ${WAVESPEED_API_KEY}
+      GOOGLE_PROJECT_ID: ${GOOGLE_PROJECT_ID}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
+      GOOGLE_LOCATION: ${GOOGLE_LOCATION:-us-central1}
+      KIE_API_KEY: ${KIE_API_KEY}
+      KIE_API_BASE: ${KIE_API_BASE:-https://api.kie.ai}
+
+      # Stripe Billing
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      DEFAULT_FREE_CREDITS: ${DEFAULT_FREE_CREDITS:-10}
+
+      # Google OAuth
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GOOGLE_REDIRECT_URI: https://${API_DOMAIN:-api.${DOMAIN}}/api/auth/google/callback
+
+      # Email (SMTP)
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      SMTP_SECURE: ${SMTP_SECURE:-true}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASS: ${SMTP_PASS}
+      EMAIL_FROM: ${EMAIL_FROM}
+
+      # Analytics
+      POSTHOG_KEY: ${POSTHOG_KEY}
+      POSTHOG_HOST: ${POSTHOG_HOST:-https://app.posthog.com}
+      POSTHOG_IP_SALT: ${POSTHOG_IP_SALT}
+
+      # Mock Modes (should be false for production)
+      MOCK_API: ${MOCK_API:-false}
+      MOCK_VIDEO: ${MOCK_VIDEO:-false}
+      MOCK_SEEDREAM4: ${MOCK_SEEDREAM4:-false}
+      MOCK_SORA: ${MOCK_SORA:-false}
+
+      # Other Settings
+      ENABLE_METRICS: ${ENABLE_METRICS:-true}
+      ENABLE_ENQUEUE_FIRST: ${ENABLE_ENQUEUE_FIRST:-true}
+      ENABLE_OUTBOX: ${ENABLE_OUTBOX:-true}
+      FORCE_OUTBOX_ONLY: ${FORCE_OUTBOX_ONLY:-true}
+      APP_BASE_URL: https://${API_DOMAIN:-api.${DOMAIN}}
+      FRONTEND_BASE_URL: https://${DOMAIN}
+      VIDEO_PROVIDER: ${VIDEO_PROVIDER:-google}
+
+      # Admin
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
     depends_on:
       postgres:
         condition: service_healthy
@@ -181,8 +244,15 @@ services:
       NODE_ENV: production
       PORT: 3000
       NEXT_PUBLIC_API_BASE: https://${API_DOMAIN:-api.${DOMAIN}}
-    env_file:
-      - .env.prod
+      NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY}
+      NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY}
+      NEXT_PUBLIC_POSTHOG_HOST: ${NEXT_PUBLIC_POSTHOG_HOST:-https://app.posthog.com}
+      NEXT_PUBLIC_SANITY_PROJECT_ID: ${NEXT_PUBLIC_SANITY_PROJECT_ID}
+      NEXT_PUBLIC_SANITY_DATASET: ${NEXT_PUBLIC_SANITY_DATASET:-production}
+      NEXT_PUBLIC_SANITY_API_VERSION: ${NEXT_PUBLIC_SANITY_API_VERSION:-2025-01-01}
+      NEXT_PUBLIC_MOCK_API: ${NEXT_PUBLIC_MOCK_API:-false}
+      NEXT_PUBLIC_DEBUG_LOGS: ${NEXT_PUBLIC_DEBUG_LOGS:-false}
+      NEXT_PUBLIC_SORA2_HIDE_PRO: ${NEXT_PUBLIC_SORA2_HIDE_PRO:-true}
     depends_on:
       backend:
         condition: service_healthy
