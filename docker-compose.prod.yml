@@ -12,7 +12,7 @@ services:
     image: postgres:16-alpine
     container_name: cooly-postgres-prod
     ports:
-      - "5432:5432"  # Exposed for external access (staging only)
+      - "15432:5432"  # Exposed for external access (staging only) - using 15432 to avoid conflicts
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-cooly}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
