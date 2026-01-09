@@ -1,0 +1,65 @@
+# ============================================================
+# Cooly AI - VPS Services (Hybrid Deployment)
+# ============================================================
+# This compose file runs Redis and MinIO on VPS
+# Frontend, Backend API, and PostgreSQL run on Render
+# ============================================================
+
+services:
+  # Redis (externally accessible for Render backend)
+  redis:
+    image: redis:7-alpine
+    container_name: cooly-redis-vps
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD} --bind 0.0.0.0
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--pass", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # MinIO S3-compatible storage (externally accessible)
+  minio:
+    image: minio/minio:latest
+    container_name: cooly-minio-vps
+    command: server /data --console-address ":9001" --address ":9000"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    container_name: cooly-minio-init-vps
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      mc mb local/${S3_BUCKET_NAME:-cooly-prod} --ignore-existing;
+      mc anonymous set download local/${S3_BUCKET_NAME:-cooly-prod};
+      echo 'MinIO bucket initialized!';
+      exit 0;
+      "
+
+volumes:
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
