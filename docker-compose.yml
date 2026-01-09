@@ -1,0 +1,168 @@
+version: '3.9'
+
+services:
+  # PostgreSQL Database (replaces Supabase)
+  postgres:
+    image: postgres:16-alpine
+    container_name: cooly-postgres
+    environment:
+      POSTGRES_USER: cooly
+      POSTGRES_PASSWORD: cooly_local_dev
+      POSTGRES_DB: cooly_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/migrations:/docker-entrypoint-initdb.d/migrations:ro
+      - ./script/docker-init-db.sh:/docker-entrypoint-initdb.d/00-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cooly -d cooly_dev"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - cooly-network
+
+  # Redis (for BullMQ queue)
+  redis:
+    image: redis:7-alpine
+    container_name: cooly-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - cooly-network
+
+  # MinIO S3-compatible storage (replaces Backblaze B2)
+  minio:
+    image: minio/minio:latest
+    container_name: cooly-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: cooly_minio
+      MINIO_ROOT_PASSWORD: cooly_minio_secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - cooly-network
+
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    container_name: cooly-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 cooly_minio cooly_minio_secret;
+      mc mb local/cooly-local --ignore-existing;
+      mc anonymous set download local/cooly-local;
+      echo 'MinIO bucket initialized!';
+      exit 0;
+      "
+    networks:
+      - cooly-network
+
+  # Backend API + Worker
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: cooly-backend
+    ports:
+      - "5001:5000"
+    environment:
+      # Server
+      NODE_ENV: development
+      PORT: 5000
+      # Database (local PostgreSQL)
+      DATABASE_URL: postgresql://cooly:cooly_local_dev@postgres:5432/cooly_dev
+      # Queue (BullMQ with local Redis)
+      REDIS_URL: redis://redis:6379
+      USE_BULLMQ: "true"
+      START_GEN_WORKER: "true"
+      START_OUTBOX_RELAY: "true"
+      GEN_WORKER_CONCURRENCY: 5
+      ENABLE_CAPTURE_WORKER: "true"
+      ENABLE_SESSION_SWEEPER: "true"
+      # Storage (MinIO)
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_URL: http://localhost:9000
+      S3_FORCE_PATH_STYLE: "true"
+      B2_BUCKET_NAME: cooly-local
+      B2_REGION: us-east-1
+      B2_ACCESS_KEY_ID: cooly_minio
+      B2_SECRET_ACCESS_KEY: cooly_minio_secret
+      # Frontend URL for CORS
+      FRONTEND_URL: http://localhost:3000
+      ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+    env_file:
+      - .env.local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - cooly-network
+
+  # Frontend (Next.js)
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE: http://localhost:5001
+        NEXT_PUBLIC_MOCK_API: "false"
+    container_name: cooly-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      NEXT_PUBLIC_API_BASE: http://localhost:5001
+    env_file:
+      - .env.local
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - cooly-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+
+networks:
+  cooly-network:
+    driver: bridge

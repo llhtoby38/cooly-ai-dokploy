@@ -1,0 +1,208 @@
+name: Sync Staging DB to Production
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+jobs:
+  sync-database:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup PostgreSQL 17 client
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y wget ca-certificates
+        wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+        echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+        sudo apt-get update
+        sudo apt-get install -y postgresql-client-17
+        # Update PATH to use PostgreSQL 17 binaries
+        echo "/usr/lib/postgresql/17/bin" >> $GITHUB_PATH
+        
+    - name: Dump Staging Schema
+      env:
+        STAGING_DATABASE_URL: postgresql://postgres.rpmgogukfzcsgvjjueft:I83V37jR89bB7pEN@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require
+      run: |
+        /usr/lib/postgresql/17/bin/pg_dump --schema-only --no-owner --no-privileges \
+          --schema=public \
+          "$STAGING_DATABASE_URL" > staging_schema.sql
+        
+    - name: Dump Production Schema
+      env:
+        PROD_DATABASE_URL: postgresql://postgres.qruqjgqbvowwdsnwpalj:XhG3inzlLMXCGbzC@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require
+      run: |
+        /usr/lib/postgresql/17/bin/pg_dump --schema-only --no-owner --no-privileges \
+          --schema=public \
+          "$PROD_DATABASE_URL" > prod_schema.sql
+        
+    - name: Generate complete schema diff
+      run: |
+        # Create a clean diff script
+        echo "-- Schema differences from staging to production" > schema_diff.sql
+        
+        # Extract complete table definitions from staging
+        awk '/^CREATE TABLE/,/^);$/' staging_schema.sql > staging_tables.sql
+        
+        # Extract complete table definitions from production  
+        awk '/^CREATE TABLE/,/^);$/' prod_schema.sql > prod_tables.sql
+        
+        # Find tables that exist in staging but not in production
+        for table in $(grep "CREATE TABLE" staging_schema.sql | sed 's/CREATE TABLE public\.//' | sed 's/ (//' | sort); do
+          if ! grep -q "CREATE TABLE public.$table" prod_schema.sql; then
+            echo "-- Adding table: $table" >> schema_diff.sql
+            awk "/^CREATE TABLE public\.$table/,/^);$/" staging_schema.sql >> schema_diff.sql
+            echo "" >> schema_diff.sql
+          fi
+        done
+        
+        # Add RLS enable lines and full CREATE POLICY blocks (multi-line safe)
+        awk '/^ALTER TABLE .* ENABLE ROW LEVEL SECURITY;/{print}' staging_schema.sql >> schema_diff.sql
+        awk '/^CREATE POLICY /{p=1} p{print} /;/{if(p){p=0}}' staging_schema.sql >> schema_diff.sql
+        
+        echo "=== Schema differences to apply ==="
+        cat schema_diff.sql
+
+    - name: Generate safe column additions (ADD COLUMN IF NOT EXISTS)
+      env:
+        STAGING_DATABASE_URL: postgresql://postgres.rpmgogukfzcsgvjjueft:I83V37jR89bB7pEN@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require
+        PROD_DATABASE_URL: postgresql://postgres.qruqjgqbvowwdsnwpalj:XhG3inzlLMXCGbzC@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require
+      run: |
+        # Extract table|column keys from both DBs and full type info from staging
+        # Only consider BASE TABLES in the public schema (exclude views, indexes, etc.)
+        /usr/lib/postgresql/17/bin/psql "$STAGING_DATABASE_URL" -Atc "
+          SELECT c.table_name || '|' || c.column_name
+          FROM information_schema.columns c
+          JOIN information_schema.tables t
+            ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+          WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+          ORDER BY 1;" > staging_cols.keys
+
+        /usr/lib/postgresql/17/bin/psql "$PROD_DATABASE_URL" -Atc "
+          SELECT c.table_name || '|' || c.column_name
+          FROM information_schema.columns c
+          JOIN information_schema.tables t
+            ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+          WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+          ORDER BY 1;" > prod_cols.keys
+
+        /usr/lib/postgresql/17/bin/psql "$STAGING_DATABASE_URL" -Atc "
+          SELECT c.table_name || '|' || c.column_name || '|' || pg_catalog.format_type(a.atttypid, a.atttypmod)
+          FROM information_schema.columns c
+          JOIN information_schema.tables t
+            ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+          JOIN pg_catalog.pg_class cl ON cl.relname = c.table_name
+          JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace AND n.nspname = 'public'
+          JOIN pg_catalog.pg_attribute a ON a.attrelid = cl.oid AND a.attname = c.column_name
+          WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE' AND a.attnum > 0 AND NOT a.attisdropped
+          ORDER BY 1;" > staging_cols.full
+
+        sort -u staging_cols.keys > staging_cols.sorted
+        sort -u prod_cols.keys > prod_cols.sorted
+
+        # Keys present in staging but missing in prod
+        comm -23 staging_cols.sorted prod_cols.sorted > missing_cols.keys || true
+
+        # Build ALTER statements for missing columns, using types from staging
+        echo "" >> schema_diff.sql
+        echo "-- Safe column additions from staging (ADD COLUMN IF NOT EXISTS)" >> schema_diff.sql
+        awk -F'|' 'NR==FNR{m[$1"|"$2]=$3; next} { tbl=$1; col=$2; typ=m[$0]; if (typ!="") { printf("ALTER TABLE public.%s ADD COLUMN IF NOT EXISTS \"%s\" %s;\n", tbl, col, typ) } }' staging_cols.full missing_cols.keys >> schema_diff.sql
+
+        echo "=== Column additions (staging -> prod) ==="
+        grep -E "ADD COLUMN" schema_diff.sql || true
+        
+    - name: Apply schema differences to production
+      env:
+        PROD_DATABASE_URL: postgresql://postgres.qruqjgqbvowwdsnwpalj:XhG3inzlLMXCGbzC@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require
+      run: |
+        if [ -s schema_diff.sql ]; then
+          echo "Applying schema differences to production..."
+          /usr/lib/postgresql/17/bin/psql "$PROD_DATABASE_URL" -f schema_diff.sql
+        else
+          echo "No schema differences found - databases are in sync"
+        fi
+        
+    - name: Sync all views (normal and materialized) from staging to production
+      env:
+        STAGING_DATABASE_URL: postgresql://postgres.rpmgogukfzcsgvjjueft:I83V37jR89bB7pEN@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require
+        PROD_DATABASE_URL: postgresql://postgres.qruqjgqbvowwdsnwpalj:XhG3inzlLMXCGbzC@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require
+      run: |
+        set -euo pipefail
+        echo "-- Generating CREATE OR REPLACE VIEW statements from staging" > staging_views.sql
+        /usr/lib/postgresql/17/bin/psql "$STAGING_DATABASE_URL" -Atc "
+          SELECT 'CREATE OR REPLACE VIEW ' || quote_ident(schemaname) || '.' || quote_ident(viewname) || ' AS ' ||
+                 pg_get_viewdef(format('%I.%I', schemaname, viewname)::regclass, true) || ';'
+          FROM pg_views
+          WHERE schemaname = 'public'
+          ORDER BY 1;" >> staging_views.sql || true
+
+        echo "-- Generating MATERIALIZED VIEW recreate statements from staging" > staging_matviews.sql
+        /usr/lib/postgresql/17/bin/psql "$STAGING_DATABASE_URL" -Atc "
+          SELECT 'DROP MATERIALIZED VIEW IF EXISTS ' || quote_ident(schemaname) || '.' || quote_ident(matviewname) || ' CASCADE; ' ||
+                 'CREATE MATERIALIZED VIEW ' || quote_ident(schemaname) || '.' || quote_ident(matviewname) || ' AS ' || definition || ';'
+          FROM pg_matviews
+          WHERE schemaname = 'public'
+          ORDER BY 1;" >> staging_matviews.sql || true
+
+        cat staging_views.sql staging_matviews.sql > staging_all_views.sql
+        echo "Applying views to production..."
+        /usr/lib/postgresql/17/bin/psql "$PROD_DATABASE_URL" -f staging_all_views.sql
+
+        echo "Refreshing materialized views on production..."
+        MATVIEWS=$(/usr/lib/postgresql/17/bin/psql "$PROD_DATABASE_URL" -Atc "SELECT schemaname||'.'||matviewname FROM pg_matviews WHERE schemaname='public';")
+        if [ -n "$MATVIEWS" ]; then
+          for mv in $MATVIEWS; do
+            echo "  Refreshing $mv"
+            /usr/lib/postgresql/17/bin/psql "$PROD_DATABASE_URL" -c "REFRESH MATERIALIZED VIEW $mv;" || true
+          done
+        else
+          echo "No materialized views to refresh"
+        fi
+
+    - name: Copy pricing tables data (Staging -> Production)
+      env:
+        STAGING_DATABASE_URL: postgresql://postgres.rpmgogukfzcsgvjjueft:I83V37jR89bB7pEN@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require
+        PROD_DATABASE_URL: postgresql://postgres.qruqjgqbvowwdsnwpalj:XhG3inzlLMXCGbzC@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require
+      run: |
+        set -euo pipefail
+
+        echo "Dumping pricing reference tables from Staging..."
+        /usr/lib/postgresql/17/bin/pg_dump \
+          --data-only --no-owner --no-privileges --column-inserts \
+          -t public.sora_video_pricing \
+          -t public.video_token_pricing \
+          -t public.video_variant_pricing \
+          -t public.image_variant_pricing \
+          -t public.image_generation_pricing \
+          "$STAGING_DATABASE_URL" > pricing_data.sql
+
+        echo "Truncating pricing reference tables on Production..."
+        /usr/lib/postgresql/17/bin/psql "$PROD_DATABASE_URL" -v ON_ERROR_STOP=1 -c "
+          TRUNCATE TABLE
+            public.sora_video_pricing,
+            public.video_token_pricing,
+            public.video_variant_pricing,
+            public.image_variant_pricing,
+            public.image_generation_pricing
+          RESTART IDENTITY CASCADE;"
+
+        echo "Loading pricing rows into Production..."
+        /usr/lib/postgresql/17/bin/psql "$PROD_DATABASE_URL" -v ON_ERROR_STOP=1 -f pricing_data.sql
+
+    - name: Verify sync completed
+      env:
+        PROD_DATABASE_URL: postgresql://postgres.qruqjgqbvowwdsnwpalj:XhG3inzlLMXCGbzC@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require
+      run: |
+        echo "=== Production database tables ==="
+        /usr/lib/postgresql/17/bin/psql "$PROD_DATABASE_URL" -c "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;"
+        echo ""
+        echo "=== Production views ==="
+        /usr/lib/postgresql/17/bin/psql "$PROD_DATABASE_URL" -c "SELECT table_name FROM information_schema.views WHERE table_schema = 'public' ORDER BY table_name;"
+        echo ""
+        echo "=== Reference table row counts ==="
+        /usr/lib/postgresql/17/bin/psql "$PROD_DATABASE_URL" -c "SELECT 'image_generation_pricing' AS table, COUNT(*) FROM public.image_generation_pricing UNION ALL SELECT 'video_token_pricing', COUNT(*) FROM public.video_token_pricing;"
+
+
+

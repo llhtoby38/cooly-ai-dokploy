@@ -1,0 +1,204 @@
+# render.hybrid.yaml — Render Configuration for Hybrid Deployment
+# =================================================================
+# Hybrid Architecture:
+#   Render: Frontend + Backend API + PostgreSQL
+#   VPS:    Redis + MinIO + Workers
+# =================================================================
+# Usage:
+#   1. Rename to render.yaml (replace existing)
+#   2. Configure environment variables in Render dashboard
+#   3. Deploy backend and frontend services
+# =================================================================
+
+databases:
+  - name: cooly-postgres
+    databaseName: cooly_prod
+    user: cooly
+    plan: starter  # Change to standard/pro for production
+    region: singapore  # Choose region closest to your VPS
+
+services:
+  # Backend API (connects to VPS Redis + MinIO)
+  - type: web
+    name: cooly-backend-hybrid
+    runtime: node
+    rootDir: .
+    region: singapore
+    plan: starter  # Change to standard/pro for production
+    buildCommand: cd backend && npm install
+    startCommand: cd backend && npm start
+
+    envVars:
+      # Server Configuration
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: LOG_LEVEL
+        value: info
+
+      # Database (Managed by Render)
+      - key: DATABASE_URL
+        fromDatabase:
+          name: cooly-postgres
+          property: connectionString
+
+      # Queue (EXTERNAL - VPS Redis)
+      - key: REDIS_URL
+        value: redis://:YOUR_REDIS_PASSWORD@YOUR_VPS_IP:6379
+        sync: false  # Manually configure
+      - key: USE_BULLMQ
+        value: true
+
+      # Worker Configuration (DISABLED - workers run on VPS)
+      - key: START_GEN_WORKER
+        value: false
+      - key: START_OUTBOX_RELAY
+        value: false
+      - key: ENABLE_CAPTURE_WORKER
+        value: false
+      - key: ENABLE_SESSION_SWEEPER
+        value: false
+
+      # Outbox Configuration (enabled for API to write to outbox)
+      - key: ENABLE_ENQUEUE_FIRST
+        value: true
+      - key: ENABLE_OUTBOX
+        value: true
+      - key: FORCE_OUTBOX_ONLY
+        value: true
+
+      # Storage (EXTERNAL - VPS MinIO)
+      - key: S3_ENDPOINT
+        value: http://YOUR_VPS_IP:9000
+        sync: false
+      - key: S3_PUBLIC_URL
+        value: http://YOUR_VPS_IP:9000
+        sync: false
+      - key: S3_FORCE_PATH_STYLE
+        value: true
+      - key: B2_BUCKET_NAME
+        value: cooly-prod
+      - key: B2_REGION
+        value: us-east-1
+      - key: B2_ACCESS_KEY_ID
+        sync: false  # Set to MinIO root user
+      - key: B2_SECRET_ACCESS_KEY
+        sync: false  # Set to MinIO root password
+
+      # Frontend URL for CORS
+      - key: FRONTEND_URL
+        value: https://test.cooly.ai
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://test.cooly.ai,https://cooly-frontend-hybrid.onrender.com
+        sync: false
+      - key: COOKIE_DOMAIN
+        value: .onrender.com
+        sync: false
+
+      # JWT & Security
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_SECRET_KEY
+        generateValue: true
+      - key: EXCHANGE_JWT_SECRET
+        generateValue: true
+
+      # Provider API Keys (from env group)
+      - fromGroup: cooly-api-keys
+
+    healthCheckPath: /healthz
+
+  # Frontend (Next.js)
+  - type: web
+    name: cooly-frontend-hybrid
+    runtime: node
+    rootDir: .
+    region: singapore
+    plan: starter
+    buildCommand: |
+      cd frontend
+      export NEXT_PUBLIC_API_BASE=https://cooly-backend-hybrid.onrender.com
+      npm install
+      npm run build
+    startCommand: cd frontend && npm start
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: NEXT_PUBLIC_API_BASE
+        value: https://cooly-backend-hybrid.onrender.com
+      - key: NEXT_PUBLIC_MOCK_API
+        value: false
+      - key: NEXT_PUBLIC_DEBUG_LOGS
+        value: false
+      # Public vars from env group
+      - fromGroup: cooly-frontend-public
+
+    healthCheckPath: /
+
+# =================================================================
+# Environment Variable Groups (Create in Render Dashboard)
+# =================================================================
+#
+# Group: cooly-api-keys
+#   BYTEPLUS_APP_ID
+#   BYTEPLUS_ACCESS_TOKEN
+#   BYTEPLUS_SECRET_KEY
+#   BYTEPLUS_ARK_API_KEY
+#   SEEDREAM4_API_KEY
+#   SEEDREAM4_MODEL_ID
+#   SEEDREAM4_API_BASE
+#   SEEDANCE_API_KEY
+#   SEEDANCE_ENDPOINT_ID
+#   SEEDANCE_API_BASE
+#   SEEDANCE_CREATE_PATHS
+#   SEEDANCE_TASK_PATHS
+#   OPENAI_API_KEY
+#   OPENAI_API_BASE
+#   SORA_PROVIDER
+#   FAL_KEY
+#   FAL_SORA_MODEL
+#   FAL_SORA_MODEL_PRO
+#   WAVESPEED_API_KEY
+#   VIDEO_PROVIDER
+#   GOOGLE_PROJECT_ID
+#   GOOGLE_CLOUD_PROJECT
+#   GOOGLE_LOCATION
+#   KIE_API_KEY
+#   KIE_API_BASE
+#   KIE_ENABLE_FALLBACK
+#   STRIPE_SECRET_KEY
+#   STRIPE_PUBLISHABLE_KEY
+#   STRIPE_WEBHOOK_SECRET
+#   GOOGLE_CLIENT_ID
+#   GOOGLE_CLIENT_SECRET
+#   GOOGLE_REDIRECT_URI
+#   SMTP_HOST
+#   SMTP_PORT
+#   SMTP_SECURE
+#   SMTP_USER
+#   SMTP_PASS
+#   EMAIL_FROM
+#   ADMIN_EMAIL
+#   ADMIN_PASSWORD
+#   ADMIN_SECRET_KEY
+#   DEFAULT_FREE_CREDITS
+#
+# Group: cooly-frontend-public
+#   NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY
+#   NEXT_PUBLIC_SANITY_PROJECT_ID
+#   NEXT_PUBLIC_SANITY_DATASET
+#   NEXT_PUBLIC_SANITY_API_VERSION
+#   NEXT_PUBLIC_POSTHOG_KEY
+#   NEXT_PUBLIC_POSTHOG_HOST
+#   NEXT_PUBLIC_SORA2_HIDE_PRO
+#   SANITY_READ_TOKEN
+#   REVALIDATE_SECRET
+#   POSTHOG_KEY
+#   POSTHOG_HOST
+#   POSTHOG_IP_SALT
+# =================================================================

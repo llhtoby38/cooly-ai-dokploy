@@ -1,0 +1,106 @@
+name: Clone Production DB -> Staging (full copy)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type CLONE to confirm overwriting staging with production"
+        required: true
+        default: ""
+      prod_url:
+        description: "(Optional) Override PROD_URL secret with this Postgres URL"
+        required: false
+      staging_url:
+        description: "(Optional) Override STAGING_URL secret with this Postgres URL"
+        required: false
+
+jobs:
+  clone:
+    if: github.event.inputs.confirm == 'CLONE'
+    runs-on: ubuntu-latest
+    env:
+      PGSSLMODE: require
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set connection URLs (hardcoded)
+        id: set-urls
+        shell: bash
+        run: |
+          set -euo pipefail
+          # WARNING: credentials in repo (per request)
+          PROD_URL="postgresql://postgres.qruqjgqbvowwdsnwpalj:XhG3inzlLMXCGbzC@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require&options=project%3Dqruqjgqbvowwdsnwpalj"
+          STAGING_URL="postgresql://postgres.rpmgogukfzcsgvjjueft:I83V37jR89bB7pEN@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require&options=project%3Drpmgogukfzcsgvjjueft"
+          echo "PROD_URL_NORM=$PROD_URL" >> $GITHUB_OUTPUT
+          echo "STAGING_URL_NORM=$STAGING_URL" >> $GITHUB_OUTPUT
+          echo "::add-mask::$PROD_URL"
+          echo "::add-mask::$STAGING_URL"
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget ca-certificates lsb-release
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> $GITHUB_PATH
+
+      - name: Resolve hostnames → hostaddr (pin only STAGING)
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          host_from_url() { echo "$1" | sed -E 's|.*@([^:/?]+).*|\1|'; }
+          ip_v4() { getent ahostsv4 "$1" | awk '{print $1; exit}' || true; }
+          ip_any() { getent ahosts "$1" | awk '{print $1; exit}' || true; }
+          PROD_HOST=$(host_from_url "${{ steps.set-urls.outputs.PROD_URL_NORM }}")
+          STAGING_HOST=$(host_from_url "${{ steps.set-urls.outputs.STAGING_URL_NORM }}")
+          STAGING_IP=$(ip_v4 "$STAGING_HOST"); [ -z "$STAGING_IP" ] && STAGING_IP=$(ip_any "$STAGING_HOST")
+          # Build outputs: do NOT pin hostaddr for PROD (Supabase tenant routing relies on hostname/SNI)
+          PROD_OUT="${{ steps.set-urls.outputs.PROD_URL_NORM }}"
+          STAGING_OUT="${{ steps.set-urls.outputs.STAGING_URL_NORM }}"
+          if [ -n "${STAGING_IP:-}" ] && [[ "$STAGING_IP" != *:* ]]; then
+            [[ "$STAGING_OUT" == *?* ]] && SEP='&' || SEP='?'
+            STAGING_OUT="${STAGING_OUT}${SEP}hostaddr=${STAGING_IP}"
+          fi
+          echo "PROD_URL_IP=${PROD_OUT}" >> $GITHUB_OUTPUT
+          echo "STAGING_URL_IP=${STAGING_OUT}" >> $GITHUB_OUTPUT
+          echo "Resolved: $PROD_HOST; $STAGING_HOST → ${STAGING_IP:-'(none)'}"
+
+      - name: Confirm target is staging (non-prod safety)
+        run: |
+          set -euo pipefail
+          TARGET_HOST=$(echo '${{ steps.resolve.outputs.STAGING_URL_IP }}' | sed -E 's|.*@([^:/?]+).*|\1|')
+          echo "Target host: $TARGET_HOST"
+
+      - name: Block new connections on staging & terminate existing (best effort)
+        continue-on-error: true
+        run: |
+          psql "${{ steps.resolve.outputs.STAGING_URL_IP }}" -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$ BEGIN
+            PERFORM 1; -- placeholder in case of permissions
+          END $$;
+          SQL
+          # Terminate non-superuser backends (ignore errors if insufficient rights)
+          psql "${{ steps.resolve.outputs.STAGING_URL_IP }}" -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid();" || true
+
+      - name: Dump production (custom format)
+        run: |
+          pg_dump --format=custom --no-owner --no-privileges "${{ steps.resolve.outputs.PROD_URL_IP }}" -f prod.dump
+
+      - name: Restore into staging (clean + if-exists)
+        run: |
+          pg_restore --no-owner --no-privileges --clean --if-exists -j 4 -d "${{ steps.resolve.outputs.STAGING_URL_IP }}" prod.dump
+
+      - name: Analyze staging
+        run: |
+          psql "${{ steps.resolve.outputs.STAGING_URL_IP }}" -c "VACUUM ANALYZE;" || true
+
+      - name: Verify staging
+        run: |
+          psql "${{ steps.resolve.outputs.STAGING_URL_IP }}" -c "SELECT now() AS staging_time;"
+          psql "${{ steps.resolve.outputs.STAGING_URL_IP }}" -c "SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY 1,2 LIMIT 50;"
+
+

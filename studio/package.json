@@ -1,0 +1,21 @@
+{
+  "name": "cooly-studio",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "sanity dev --host",
+    "build": "sanity build",
+    "start": "sanity start"
+  },
+  "dependencies": {
+    "@sanity/vision": "latest",
+    "react": "^18",
+    "react-dom": "^18",
+    "sanity": "latest",
+    "styled-components": "^6.1.19"
+  },
+  "devDependencies": {
+    "typescript": "^5"
+  }
+}

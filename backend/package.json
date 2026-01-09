@@ -1,0 +1,50 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon --legacy-watch --watch src src/app.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "diag:queue": "node scripts/diagnostics/queueSmokeTest.js",
+    "test:integration": "node scripts/tests/integration.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.873.0",
+    "@aws-sdk/client-sqs": "^3.922.0",
+    "@aws-sdk/client-sts": "^3.922.0",
+    "@aws-sdk/lib-storage": "^3.917.0",
+    "@aws-sdk/s3-request-presigner": "^3.873.0",
+    "@fal-ai/client": "^1.6.2",
+    "axios": "^1.10.0",
+    "bcryptjs": "^3.0.2",
+    "bullmq": "^5.63.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "crypto-js": "^4.2.0",
+    "dotenv": "^17.2.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^7.4.1",
+    "google-auth-library": "^9.15.1",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.8.2",
+    "jsonwebtoken": "^9.0.2",
+    "nodemailer": "^6.9.12",
+    "pg": "^8.16.3",
+    "pino": "^8.19.0",
+    "pino-http": "^8.5.0",
+    "pino-pretty": "^10.3.1",
+    "posthog-node": "^4.1.0",
+    "sharp": "^0.33.5",
+    "stripe": "^18.4.0",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}

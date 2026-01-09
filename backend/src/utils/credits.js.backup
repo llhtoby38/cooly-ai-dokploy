@@ -1,0 +1,633 @@
+const db = require('../db');
+
+/**
+ * Compute available credits considering active (non-expired) reservations
+ */
+async function getAvailableCredits(userId) {
+  const { rows } = await db.query(
+    `SELECT 
+       u.credits AS balance,
+       COALESCE((
+         SELECT SUM(amount) FROM credit_reservations 
+         WHERE user_id = $1 AND status = 'reserved' 
+           AND (expires_at IS NULL OR expires_at > NOW())
+       ), 0) AS reserved
+     FROM users u WHERE u.id = $1`,
+    [userId]
+  );
+  if (!rows.length) return { success: false, error: 'User not found' };
+  const balance = Number(rows[0].balance) || 0;
+  const reserved = Number(rows[0].reserved) || 0;
+  return { success: true, available: Math.max(0, balance - reserved), balance, reserved };
+}
+
+/**
+ * Reserve credits (soft hold). Does not change user balance.
+ */
+async function reserveCredits(userId, amount, options = {}) {
+  const description = options?.description || null;
+  const sessionId = options?.sessionId || null;
+  const ttlSeconds = Number(options?.ttlSeconds || 3600);
+  const expiresAtExpr = ttlSeconds > 0 ? `NOW() + INTERVAL '${ttlSeconds} seconds'` : 'NULL';
+
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+    const { rows: u } = await client.query('SELECT id, credits FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    if (!u.length) { await client.query('ROLLBACK'); return { success: false, error: 'User not found' }; }
+
+    const { rows: resRows } = await client.query(
+      `SELECT COALESCE(SUM(amount),0) AS reserved FROM credit_reservations 
+       WHERE user_id = $1 AND status = 'reserved' AND (expires_at IS NULL OR expires_at > NOW())`,
+      [userId]
+    );
+    const balance = Number(u[0].credits) || 0;
+    const reserved = Number(resRows[0].reserved) || 0;
+    if ((balance - reserved) < amount) {
+      await client.query('ROLLBACK');
+      return { success: false, error: 'Insufficient credits', creditsLeft: balance - reserved };
+    }
+
+    const ins = await client.query(
+      `INSERT INTO credit_reservations (user_id, amount, status, session_id, description, expires_at)
+       VALUES ($1, $2, 'reserved', $3, $4, ${expiresAtExpr}) RETURNING id, expires_at`,
+      [userId, amount, sessionId, description]
+    );
+    // Notify new availability immediately (deliver on COMMIT)
+    try {
+      const reservedNow = reserved + amount;
+      const availableNow = Math.max(0, balance - reservedNow);
+      await client.query('SELECT pg_notify($1, $2)', [
+        'credits_changed',
+        JSON.stringify({
+          user_id: userId,
+          credits: balance,
+          available: availableNow,
+          reserved: reservedNow,
+          event: 'reserved',
+          reservation_id: ins.rows[0].id,
+          delta: amount,
+          event_ts: Date.now()
+        })
+      ]);
+    } catch (_) {}
+    await client.query('COMMIT');
+    return { success: true, reservationId: ins.rows[0].id, expiresAt: ins.rows[0].expires_at };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('reserveCredits error:', e);
+    return { success: false, error: 'Database error' };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Capture a reservation: performs a debit and marks captured
+ */
+async function captureReservation(reservationId, options = {}) {
+  const descriptionOverride = options?.description || null;
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+    const { rows: rRows } = await client.query(
+      `SELECT cr.*, u.credits 
+       FROM credit_reservations cr 
+       JOIN users u ON u.id = cr.user_id 
+       WHERE cr.id = $1 FOR UPDATE`,
+      [reservationId]
+    );
+    if (!rRows.length) { await client.query('ROLLBACK'); return { success: false, error: 'Reservation not found' }; }
+    const r = rRows[0];
+    if (r.status !== 'reserved') { await client.query('ROLLBACK'); return { success: false, error: `Invalid reservation status: ${r.status}` }; }
+    if (r.expires_at && new Date(r.expires_at) < new Date()) {
+      await client.query("UPDATE credit_reservations SET status='expired', released_at=NOW() WHERE id=$1", [reservationId]);
+      await client.query('COMMIT');
+      return { success: false, error: 'Reservation expired' };
+    }
+
+    // Perform the debit using lot-aware path
+    // Temporarily bypass trigger duplication inside this tx
+    await client.query("SELECT set_config('app.bypass_credits_trigger','1', true)");
+    // Delegate to legacy path by calling debit via a separate helper using same client? Reuse SQL inline for precision.
+    const amount = Number(r.amount) || 0;
+
+    // Attempt lot-based debit first
+    let toConsume = amount;
+    const lotsRes = await client.query(
+      `select id, remaining, expires_at from credit_lots 
+       where user_id=$1 and remaining>0 and (closed_at is null)
+       order by expires_at asc, created_at asc for update`,
+      [r.user_id]
+    );
+    let lastBalance = 0;
+    if (lotsRes.rows.length > 0) {
+      for (const lot of lotsRes.rows) {
+        if (toConsume <= 0) break;
+        const take = Math.min(Number(lot.remaining), toConsume);
+        if (take > 0) {
+          await client.query('UPDATE credit_lots SET remaining = remaining - $1 WHERE id = $2', [take, lot.id]);
+          const remSum = await client.query(
+            `select coalesce(sum(remaining),0) as rem from credit_lots 
+             where user_id=$1 and remaining>0 and (closed_at is null) and ((expires_at > now()) or source='one_off')`,
+            [r.user_id]
+          );
+          lastBalance = Number(remSum.rows[0].rem || 0);
+          const txDescription = descriptionOverride || (r.description || 'Credit usage');
+          await client.query(
+            'INSERT INTO credit_transactions (user_id, description, amount, balance_after, lot_id, expires_at, reservation_id) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+            [r.user_id, txDescription, -take, lastBalance, lot.id, lot.expires_at, reservationId]
+          );
+          toConsume -= take;
+        }
+      }
+      if (toConsume > 0) {
+        await client.query("SELECT set_config('app.bypass_credits_trigger','0', true)");
+        await client.query('ROLLBACK');
+        return { success: false, error: 'Insufficient credits to capture' };
+      }
+      await client.query('UPDATE users SET credits = $1 WHERE id = $2', [lastBalance, r.user_id]);
+    } else {
+      // Fallback: direct debit
+      const cur = Number(r.credits) || 0;
+      if (cur < amount) {
+        await client.query("SELECT set_config('app.bypass_credits_trigger','0', true)");
+        await client.query('ROLLBACK');
+        return { success: false, error: 'Insufficient credits to capture' };
+      }
+      const newBal = cur - amount;
+      await client.query('UPDATE users SET credits = $1 WHERE id = $2', [newBal, r.user_id]);
+      const txDescription = descriptionOverride || (r.description || 'Credit usage');
+      await client.query('INSERT INTO credit_transactions (user_id, description, amount, balance_after, reservation_id) VALUES ($1,$2,$3,$4,$5)', [r.user_id, txDescription, -amount, newBal, reservationId]);
+    }
+
+    await client.query("SELECT set_config('app.bypass_credits_trigger','0', true)");
+    await client.query("UPDATE credit_reservations SET status='captured', captured_at=NOW() WHERE id=$1", [reservationId]);
+    // Sync summary tables and notify (deliver on COMMIT)
+    try {
+      const { rows: ar } = await client.query(
+        `SELECT 
+           u.credits AS balance,
+           COALESCE((SELECT SUM(amount) FROM credit_reservations 
+             WHERE user_id = $1 AND status = 'reserved' 
+               AND (expires_at IS NULL OR expires_at > NOW())), 0) AS reserved
+         FROM users u WHERE u.id = $1`,
+        [r.user_id]
+      );
+      const bal = Number(ar[0]?.balance || 0);
+      const resv = Number(ar[0]?.reserved || 0);
+      const available = Math.max(0, bal - resv);
+
+      // Best-effort sync to email_credit_tracking.current_balance
+      try {
+        const { rows: urow } = await client.query('SELECT email FROM users WHERE id=$1', [r.user_id]);
+        const userEmail = urow[0]?.email || null;
+        if (userEmail) {
+          const upd = await client.query(
+            'UPDATE email_credit_tracking SET current_balance = $1, last_updated_at = NOW() WHERE email = $2',
+            [bal, userEmail]
+          );
+          if (upd.rowCount === 0) {
+            await client.query(
+              'INSERT INTO email_credit_tracking (email, total_credits_given, current_balance) VALUES ($1,$2,$3)',
+              [userEmail, 0, bal]
+            );
+          }
+        }
+      } catch (_) {}
+
+      await client.query('SELECT pg_notify($1, $2)', [
+        'credits_changed',
+        JSON.stringify({ user_id: r.user_id, credits: bal, available, reserved: resv, event: 'captured', reservation_id: reservationId, event_ts: Date.now() })
+      ]);
+    } catch (_) {}
+    await client.query('COMMIT');
+    return { success: true };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('captureReservation error:', e);
+    return { success: false, error: 'Database error' };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Release a reservation without debiting
+ */
+async function releaseReservation(reservationId) {
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query('SELECT user_id, status, amount FROM credit_reservations WHERE id = $1 FOR UPDATE', [reservationId]);
+    if (!rows.length) { await client.query('ROLLBACK'); return { success: false, error: 'Reservation not found' }; }
+    const status = rows[0].status;
+    const uid = rows[0].user_id;
+    const amt = Number(rows[0].amount || 0);
+    if (status !== 'reserved') { await client.query('ROLLBACK'); return { success: false, error: `Invalid reservation status: ${status}` }; }
+    await client.query("UPDATE credit_reservations SET status='released', released_at=NOW() WHERE id=$1", [reservationId]);
+    // Compute available after release and notify (deliver on COMMIT)
+    try {
+      if (uid) {
+        const { rows: ar } = await client.query(
+          `SELECT 
+             u.credits AS balance,
+             COALESCE((SELECT SUM(amount) FROM credit_reservations 
+               WHERE user_id = $1 AND status = 'reserved' 
+                 AND (expires_at IS NULL OR expires_at > NOW())), 0) AS reserved
+           FROM users u WHERE u.id = $1`,
+          [uid]
+        );
+        const bal = Number(ar[0]?.balance || 0);
+        const resv = Number(ar[0]?.reserved || 0);
+        const available = Math.max(0, bal - resv);
+        await client.query('SELECT pg_notify($1, $2)', [
+          'credits_changed',
+          JSON.stringify({ user_id: uid, credits: bal, available, reserved: resv, event: 'released', reservation_id, delta: amt, event_ts: Date.now() })
+        ]);
+      }
+    } catch (_) {}
+    await client.query('COMMIT');
+    return { success: true };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('releaseReservation error:', e);
+    return { success: false, error: 'Database error' };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Debit credits from a user's account
+ * @param {string} userId - The user's ID
+ * @param {number} amount - Amount of credits to debit
+ * @returns {Promise<{success: boolean, creditsLeft: number, error?: string}>}
+ */
+async function debitCredits(userId, amount, options = {}) {
+  const descriptionOverride = options && options.description ? String(options.description) : null;
+  const reservationIdOpt = options && options.reservationId ? String(options.reservationId) : null;
+  const client = await db.getClient();
+  
+  try {
+    await client.query('BEGIN');
+    // Prevent ledger trigger from double-logging; we insert transactions explicitly below
+    await client.query("SELECT set_config('app.bypass_credits_trigger','1', true)");
+
+    // Attempt lot-based debit first (FIFO by expiry)
+    let toConsume = amount;
+    let lastBalance = 0;
+    const lotsRes = await client.query(
+      `select id, remaining, expires_at from credit_lots 
+       where user_id=$1 and remaining>0 and (closed_at is null)
+       order by expires_at asc, created_at asc for update`,
+      [userId]
+    );
+    if (lotsRes.rows.length > 0) {
+      for (const lot of lotsRes.rows) {
+        if (toConsume <= 0) break;
+        const take = Math.min(Number(lot.remaining), toConsume);
+        if (take > 0) {
+          await client.query('UPDATE credit_lots SET remaining = remaining - $1 WHERE id = $2', [take, lot.id]);
+          // compute remaining credits from lots (non-expired or non-expiring one_off)
+          const remSum = await client.query(
+            `select coalesce(sum(remaining),0) as rem from credit_lots 
+             where user_id=$1 and remaining>0 and (closed_at is null) and ((expires_at > now()) or source='one_off')`,
+            [userId]
+          );
+          lastBalance = Number(remSum.rows[0].rem || 0);
+          const txDescription = descriptionOverride || 'Credit usage';
+          await client.query(
+            'INSERT INTO credit_transactions (user_id, description, amount, balance_after, lot_id, expires_at, reservation_id) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+            [userId, txDescription, -take, lastBalance, lot.id, lot.expires_at, reservationIdOpt]
+          );
+          toConsume -= take;
+        }
+      }
+      if (toConsume > 0) {
+        await client.query('ROLLBACK');
+        return { success: false, error: 'Insufficient credits', creditsLeft: lastBalance };
+      }
+      // sync cache
+      await client.query('UPDATE users SET credits = $1 WHERE id = $2', [lastBalance, userId]);
+      // Notify credits/available
+      try {
+        const { rows: ar } = await client.query(
+          `SELECT 
+             u.credits AS balance,
+             COALESCE((SELECT SUM(amount) FROM credit_reservations 
+               WHERE user_id = $1 AND status = 'reserved' 
+                 AND (expires_at IS NULL OR expires_at > NOW())), 0) AS reserved
+           FROM users u WHERE u.id = $1`,
+          [userId]
+        );
+        const bal = Number(ar[0]?.balance || 0);
+        const resv = Number(ar[0]?.reserved || 0);
+        const available = Math.max(0, bal - resv);
+        await client.query('SELECT pg_notify($1, $2)', [
+          'credits_changed',
+          JSON.stringify({ user_id: userId, credits: bal, available, reserved: resv, event: 'debit', event_ts: Date.now() })
+        ]);
+      } catch (_) {}
+      await client.query("SELECT set_config('app.bypass_credits_trigger','0', true)");
+      await client.query('COMMIT');
+      return { success: true, creditsLeft: lastBalance };
+    }
+
+    // Legacy path if no lots exist: lock user row and debit
+    const legacy = await client.query('SELECT email, credits FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    if (legacy.rows.length === 0) { await client.query('ROLLBACK'); return { success: false, error: 'User not found' }; }
+    const userEmail = legacy.rows[0].email;
+    const currentCredits = legacy.rows[0].credits;
+    if (currentCredits < amount) { await client.query('ROLLBACK'); return { success: false, error: 'Insufficient credits', creditsLeft: currentCredits }; }
+    await client.query('UPDATE users SET credits = credits - $1 WHERE id = $2', [amount, userId]);
+    // Read authoritative balance after update (avoids stale balance_after)
+    const { rows: balRow } = await client.query('SELECT credits FROM users WHERE id = $1', [userId]);
+    const newCredits = Number(balRow[0]?.credits ?? (currentCredits - amount));
+    const txDescription = descriptionOverride || 'Credit usage';
+    await client.query('INSERT INTO credit_transactions (user_id, description, amount, balance_after, reservation_id) VALUES ($1,$2,$3,$4,$5)', [userId, txDescription, -amount, newCredits, reservationIdOpt]);
+
+    // Keep email_credit_tracking balances in sync for this email (best-effort)
+    try {
+      // Fetch current split
+      const { rows: trackRows } = await client.query(
+        'SELECT free_balance, paid_balance FROM email_credit_tracking WHERE email = $1',
+        [userEmail]
+      );
+      if (trackRows.length > 0) {
+        const freeBal = Number(trackRows[0].free_balance) || 0;
+        const paidBal = Number(trackRows[0].paid_balance) || 0;
+        const debitFromFree = Math.min(freeBal, amount);
+        const remaining = amount - debitFromFree;
+        const debitFromPaid = Math.min(paidBal, Math.max(remaining, 0));
+        const newFree = freeBal - debitFromFree;
+        const newPaid = paidBal - debitFromPaid;
+
+        await client.query(
+          'UPDATE email_credit_tracking SET current_balance = $1, free_balance = $2, paid_balance = $3, last_updated_at = NOW() WHERE email = $4',
+          [newCredits, newFree, newPaid, userEmail]
+        );
+      } else {
+        // No tracking row found; just update current_balance best-effort
+        await client.query(
+          'INSERT INTO email_credit_tracking (email, total_credits_given, current_balance, free_balance, paid_balance) VALUES ($1, $2, $3, $4, $5)',
+          [userEmail, 0, newCredits, 0, Math.max(newCredits, 0)]
+        );
+      }
+    } catch (syncErr) {
+      // Non-fatal: continue even if tracking row missing
+      console.warn('email_credit_tracking sync (debit) failed:', syncErr.message || syncErr);
+    }
+
+    // Notify credits/available
+    try {
+      const { rows: ar } = await client.query(
+        `SELECT 
+           u.credits AS balance,
+           COALESCE((SELECT SUM(amount) FROM credit_reservations 
+             WHERE user_id = $1 AND status = 'reserved' 
+               AND (expires_at IS NULL OR expires_at > NOW())), 0) AS reserved
+         FROM users u WHERE u.id = $1`,
+        [userId]
+      );
+      const bal = Number(ar[0]?.balance || 0);
+      const resv = Number(ar[0]?.reserved || 0);
+      const available = Math.max(0, bal - resv);
+      await client.query('SELECT pg_notify($1, $2)', [
+        'credits_changed',
+        JSON.stringify({ user_id: userId, credits: newCredits, available, reserved: resv, event: 'credit_add', event_ts: Date.now() })
+      ]);
+    } catch (_) {}
+    await client.query("SELECT set_config('app.bypass_credits_trigger','0', true)");
+    await client.query('COMMIT');
+    
+    return { 
+      success: true, 
+      creditsLeft: currentCredits - amount 
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Credit debit error:', error);
+    return { success: false, error: 'Database error' };
+  } finally {
+    try { await client.query("SELECT set_config('app.bypass_credits_trigger','0', true)"); } catch (_) {}
+    client.release();
+  }
+}
+
+/**
+ * Add credits to a user's account
+ * @param {string} userId - The user's ID
+ * @param {number} amount - Amount of credits to add
+ * @returns {Promise<{success: boolean, creditsLeft: number, error?: string}>}
+ */
+async function addCredits(userId, amount, options = {}) {
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+    await client.query("SELECT set_config('app.bypass_credits_trigger','1', true)");
+    // Get user email for tracking sync
+    const { rows: userRows } = await client.query(
+      'SELECT email FROM users WHERE id = $1 FOR UPDATE',
+      [userId]
+    );
+    if (userRows.length === 0) { await client.query('ROLLBACK'); return { success: false, error: 'User not found' }; }
+    const userEmail = userRows[0].email;
+
+    // Insert a lot (default one_off) that expires in 32 days
+    const source = options.source || 'one_off';
+    const desc = options.description || `Credits purchased (${source})`;
+    const lotIns = await client.query(
+      `INSERT INTO credit_lots (user_id, source, amount, remaining, expires_at)
+       VALUES ($1,$2,$3,$3, NOW() + interval '32 days')
+       RETURNING id, expires_at`,
+      [userId, source, amount]
+    );
+    const lotId = lotIns.rows[0]?.id || null;
+    const lotExpiresAt = lotIns.rows[0]?.expires_at || null;
+
+    const sumRes = await client.query(
+      `select coalesce(sum(remaining),0) as rem from credit_lots 
+       where user_id=$1 and remaining>0 and (closed_at is null) and ((expires_at > now()) or source='one_off')`,
+      [userId]
+    );
+    const newCredits = Number(sumRes.rows[0].rem || 0);
+    await client.query('UPDATE users SET credits = $1 WHERE id = $2', [newCredits, userId]);
+    await client.query(
+      'INSERT INTO credit_transactions (user_id, description, amount, balance_after, lot_id, expires_at) VALUES ($1,$2,$3,$4,$5,$6)',
+      [userId, desc, amount, newCredits, lotId, lotExpiresAt]
+    );
+
+    // Best-effort sync to email_credit_tracking (do not change total_credits_given for purchases)
+    try {
+      const upd = await client.query(
+        'UPDATE email_credit_tracking SET current_balance = $1, last_updated_at = NOW() WHERE email = $2',
+        [newCredits, userEmail]
+      );
+      if (upd.rowCount === 0) {
+        await client.query(
+          'INSERT INTO email_credit_tracking (email, total_credits_given, current_balance) VALUES ($1, $2, $3)',
+          [userEmail, 0, newCredits]
+        );
+      }
+    } catch (syncErr) {
+      console.warn('email_credit_tracking sync (add) failed:', syncErr.message || syncErr);
+    }
+
+    // Notify credits/available (deliver on COMMIT)
+    try {
+      const { rows: ar } = await client.query(
+        `SELECT 
+           u.credits AS balance,
+           COALESCE((SELECT SUM(amount) FROM credit_reservations 
+             WHERE user_id = $1 AND status = 'reserved' 
+               AND (expires_at IS NULL OR expires_at > NOW())), 0) AS reserved
+         FROM users u WHERE u.id = $1`,
+        [userId]
+      );
+      const bal = Number(ar[0]?.balance || 0);
+      const resv = Number(ar[0]?.reserved || 0);
+      const available = Math.max(0, bal - resv);
+      await client.query('SELECT pg_notify($1, $2)', [
+        'credits_changed',
+        JSON.stringify({ user_id: userId, credits: newCredits, available })
+      ]);
+    } catch (_) {}
+    await client.query("SELECT set_config('app.bypass_credits_trigger','0', true)");
+    await client.query('COMMIT');
+    return { success: true, creditsLeft: newCredits };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Credit add error:', error);
+    return { success: false, error: 'Database error' };
+  } finally {
+    try { await client.query("SELECT set_config('app.bypass_credits_trigger','0', true)"); } catch (_) {}
+    client.release();
+  }
+}
+
+/**
+ * Get user's current credit balance
+ * @param {string} userId - The user's ID
+ * @returns {Promise<{success: boolean, credits: number, error?: string}>}
+ */
+async function getCredits(userId) {
+  try {
+    const { rows } = await db.query(
+      'SELECT credits FROM users WHERE id = $1',
+      [userId]
+    );
+
+    if (rows.length === 0) {
+      return { success: false, error: 'User not found' };
+    }
+
+    return { 
+      success: true, 
+      credits: rows[0].credits 
+    };
+  } catch (error) {
+    console.error('Get credits error:', error);
+    return { success: false, error: 'Database error' };
+  }
+}
+
+module.exports = {
+  debitCredits,
+  addCredits,
+  getCredits,
+  getAvailableCredits,
+  reserveCredits,
+  captureReservation,
+  releaseReservation,
+  /**
+   * Grant a new subscription cycle lot and close previous subscription lots.
+   */
+  addSubscriptionCredits: async function addSubscriptionCredits(userId, amount, planKey, opts = {}) {
+    const client = await db.getClient();
+    try {
+      await client.query('BEGIN');
+      // Detect if target cycle lot already exists; if so, do nothing (avoid expiring current lot)
+      const cycleStartTs = opts.cycleStart || new Date();
+      const cycleEndTs = opts.cycleEnd || null;
+      const { rows: existing } = await client.query(
+        `select id from credit_lots where user_id=$1 and source='subscription' and cycle_start = $2 limit 1`,
+        [userId, cycleStartTs]
+      );
+      if (existing.length > 0) {
+        const sumResPre = await client.query(
+              `select coalesce(sum(remaining),0) as rem from credit_lots
+               where user_id=$1 and remaining>0 and (closed_at is null) and ((expires_at > now()) or source='one_off')`,
+          [userId]
+        );
+        const curBal = Number(sumResPre.rows[0].rem || 0);
+        await client.query('COMMIT');
+        return { success: true, creditsLeft: curBal, lotCreated: false };
+      }
+      // 1) Log and close previous subscription lots (expire-on-renew)
+      const { rows: prevLots } = await client.query(
+        `select id, remaining, expires_at from credit_lots
+         where user_id=$1 and source='subscription' and closed_at is null and remaining > 0
+         order by expires_at asc, created_at asc for update`,
+        [userId]
+      );
+      if (prevLots.length > 0) {
+        // Insert negative transactions for expiring leftover balances
+        for (const lot of prevLots) {
+          const rem = Number(lot.remaining || 0);
+          if (rem > 0) {
+            // Balance after will be recomputed below; set to snapshot for now
+            const { rows: balRows } = await client.query(
+              `select coalesce(sum(remaining),0) as rem from credit_lots
+               where user_id=$1 and remaining>0 and (closed_at is null) and ((expires_at > now()) or source='one_off')`,
+              [userId]
+            );
+            const snapBal = Number(balRows[0]?.rem || 0) - rem;
+            await client.query(
+              `insert into credit_transactions (user_id, description, amount, balance_after, lot_id, expires_at)
+               values ($1,$2,$3,$4,$5,$6)`,
+              [userId, 'Expired credits (renewal)', -rem, Math.max(snapBal, 0), lot.id, lot.expires_at]
+            );
+          }
+        }
+        // Close and zero out previous lots
+        await client.query(
+          `update credit_lots set closed_at = now(), remaining = 0
+           where user_id=$1 and source='subscription' and closed_at is null`,
+          [userId]
+        );
+      }
+      // Insert new monthly lot with provided cycle window (idempotent by user_id+source+cycle_start)
+      const { rows: ins } = await client.query(
+        `insert into credit_lots (user_id, source, plan_key, cycle_start, amount, remaining, expires_at)
+         values ($1,'subscription',$2, $3, $4, $4, coalesce($5, now() + interval '32 days'))
+         on conflict (user_id, source, cycle_start) do nothing
+         returning id`,
+        [userId, planKey || null, cycleStartTs, amount, cycleEndTs]
+      );
+      const lotCreated = ins.length > 0;
+      // Recompute cached balance
+      const sumRes = await client.query(
+        `select coalesce(sum(remaining),0) as rem from credit_lots
+         where user_id=$1 and remaining>0 and (closed_at is null) and ((expires_at > now()) or source='one_off')`,
+        [userId]
+      );
+      const newBal = Number(sumRes.rows[0].rem || 0);
+      await client.query('update users set credits=$1 where id=$2', [newBal, userId]);
+      if (lotCreated) {
+        await client.query(
+          'insert into credit_transactions (user_id, description, amount, balance_after, lot_id, expires_at) values ($1,$2,$3,$4,$5,$6)',
+          [userId, `Subscription credits (${planKey || 'plan'})`, amount, newBal, ins[0].id, null]
+        );
+      }
+      await client.query('COMMIT');
+      return { success: true, creditsLeft: newBal, lotCreated };
+    } catch (e) {
+      await client.query('ROLLBACK');
+      console.error('addSubscriptionCredits error:', e);
+      return { success: false, error: 'Database error' };
+    } finally {
+      client.release();
+    }
+  }
+}; 

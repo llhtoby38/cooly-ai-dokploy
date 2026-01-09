@@ -1,0 +1,227 @@
+version: '3.9'
+
+# ============================================================
+# Cooly AI - VPS Workers & Storage (Hybrid Deployment)
+# ============================================================
+# This compose file runs ONLY workers and storage on VPS
+# Frontend, Backend API, and PostgreSQL run on Render
+# ============================================================
+# Architecture:
+#   Render: Frontend + Backend API + PostgreSQL
+#   VPS:    Redis + MinIO + Workers
+# ============================================================
+
+services:
+  # Redis (for BullMQ queue)
+  redis:
+    image: redis:7-alpine
+    container_name: cooly-redis-workers
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD} --bind 0.0.0.0
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--pass", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cooly-network
+    restart: unless-stopped
+
+  # MinIO S3-compatible storage
+  minio:
+    image: minio/minio:latest
+    container_name: cooly-minio-workers
+    command: server /data --console-address ":9001" --address ":9000"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - cooly-network
+    restart: unless-stopped
+
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    container_name: cooly-minio-init-workers
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      mc mb local/${S3_BUCKET_NAME} --ignore-existing;
+      mc anonymous set download local/${S3_BUCKET_NAME};
+      echo 'MinIO bucket initialized!';
+      exit 0;
+      "
+    networks:
+      - cooly-network
+
+  # Generation Worker (processes image/video jobs)
+  gen-worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        NODE_ENV: production
+    container_name: cooly-gen-worker
+    environment:
+      # Server (not actually serving HTTP)
+      NODE_ENV: production
+      PORT: 5000
+
+      # Database (EXTERNAL - Render PostgreSQL)
+      DATABASE_URL: ${DATABASE_URL}
+
+      # Queue (LOCAL Redis)
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      USE_BULLMQ: "true"
+      START_GEN_WORKER: "true"
+      START_OUTBOX_RELAY: "false"  # Outbox relay runs separately
+      GEN_WORKER_CONCURRENCY: ${GEN_WORKER_CONCURRENCY:-5}
+      ENABLE_CAPTURE_WORKER: "false"  # Capture worker runs separately
+      ENABLE_SESSION_SWEEPER: "false"  # Session sweeper runs separately
+
+      # Storage (LOCAL MinIO)
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_URL: ${S3_PUBLIC_URL}  # External URL for MinIO
+      S3_FORCE_PATH_STYLE: "true"
+      B2_BUCKET_NAME: ${S3_BUCKET_NAME}
+      B2_REGION: us-east-1
+      B2_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      B2_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+
+      # API Keys (from .env.workers)
+      JWT_SECRET: ${JWT_SECRET}
+    env_file:
+      - .env.workers
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    command: node src/queue/genWorker.js
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('ioredis').prototype.ping.call(new (require('ioredis'))(process.env.REDIS_URL))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - cooly-network
+    restart: unless-stopped
+
+  # Outbox Relay (polls database outbox and sends to queue)
+  outbox-relay:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        NODE_ENV: production
+    container_name: cooly-outbox-relay
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      USE_BULLMQ: "true"
+      START_OUTBOX_RELAY: "true"
+      START_GEN_WORKER: "false"
+      JWT_SECRET: ${JWT_SECRET}
+    env_file:
+      - .env.workers
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: node src/workers/outboxRelay.js
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('ioredis').prototype.ping.call(new (require('ioredis'))(process.env.REDIS_URL))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - cooly-network
+    restart: unless-stopped
+
+  # Capture Worker (captures reserved credits after successful generation)
+  capture-worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        NODE_ENV: production
+    container_name: cooly-capture-worker
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL}
+      ENABLE_CAPTURE_WORKER: "true"
+      JWT_SECRET: ${JWT_SECRET}
+    env_file:
+      - .env.workers
+    command: node src/workers/captureWorker.js
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('pg').Pool.prototype.query.call(new (require('pg').Pool)({connectionString:process.env.DATABASE_URL}), 'SELECT 1')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - cooly-network
+    restart: unless-stopped
+
+  # Session Sweeper (checks pending video generations for completion)
+  session-sweeper:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        NODE_ENV: production
+    container_name: cooly-session-sweeper
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL}
+      ENABLE_SESSION_SWEEPER: "true"
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_URL: ${S3_PUBLIC_URL}
+      S3_FORCE_PATH_STYLE: "true"
+      B2_BUCKET_NAME: ${S3_BUCKET_NAME}
+      B2_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      B2_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+    env_file:
+      - .env.workers
+    command: node src/workers/sessionSweeper.js
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('pg').Pool.prototype.query.call(new (require('pg').Pool)({connectionString:process.env.DATABASE_URL}), 'SELECT 1')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - cooly-network
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+
+networks:
+  cooly-network:
+    driver: bridge

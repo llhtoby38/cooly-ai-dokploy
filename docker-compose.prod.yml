@@ -1,0 +1,215 @@
+version: '3.9'
+
+# ============================================================
+# Cooly AI - Production Deployment (Dokploy/VM)
+# ============================================================
+# This compose file is optimized for deployment on Dokploy
+# with Traefik reverse proxy for SSL/domain management
+# ============================================================
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: cooly-postgres-prod
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cooly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-cooly_prod}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/migrations:/docker-entrypoint-initdb.d/migrations:ro
+      - ./script/docker-init-db.sh:/docker-entrypoint-initdb.d/00-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cooly} -d ${POSTGRES_DB:-cooly_prod}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - cooly-network
+    restart: unless-stopped
+
+  # Redis (for BullMQ queue)
+  redis:
+    image: redis:7-alpine
+    container_name: cooly-redis-prod
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--pass", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cooly-network
+    restart: unless-stopped
+
+  # MinIO S3-compatible storage
+  minio:
+    image: minio/minio:latest
+    container_name: cooly-minio-prod
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - cooly-network
+    restart: unless-stopped
+    labels:
+      # Traefik routing for MinIO API (internal only, no external access needed)
+      - "traefik.enable=true"
+      - "traefik.http.routers.minio-api.rule=Host(`${MINIO_DOMAIN:-minio.${DOMAIN}}`)"
+      - "traefik.http.routers.minio-api.entrypoints=websecure"
+      - "traefik.http.routers.minio-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.minio-api.service=minio-api"
+      - "traefik.http.services.minio-api.loadbalancer.server.port=9000"
+      # Traefik routing for MinIO Console (admin access)
+      - "traefik.http.routers.minio-console.rule=Host(`${MINIO_CONSOLE_DOMAIN:-minio-console.${DOMAIN}}`)"
+      - "traefik.http.routers.minio-console.entrypoints=websecure"
+      - "traefik.http.routers.minio-console.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.minio-console.service=minio-console"
+      - "traefik.http.services.minio-console.loadbalancer.server.port=9001"
+
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    container_name: cooly-minio-init-prod
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      mc mb local/${S3_BUCKET_NAME} --ignore-existing;
+      mc anonymous set download local/${S3_BUCKET_NAME};
+      echo 'MinIO bucket initialized!';
+      exit 0;
+      "
+    networks:
+      - cooly-network
+
+  # Backend API + Worker
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        NODE_ENV: production
+    container_name: cooly-backend-prod
+    environment:
+      # Server
+      NODE_ENV: production
+      PORT: 5000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-cooly}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-cooly_prod}
+
+      # Queue (BullMQ with Redis)
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      USE_BULLMQ: "true"
+      START_GEN_WORKER: "true"
+      START_OUTBOX_RELAY: "true"
+      GEN_WORKER_CONCURRENCY: ${GEN_WORKER_CONCURRENCY:-5}
+      ENABLE_CAPTURE_WORKER: "true"
+      ENABLE_SESSION_SWEEPER: "true"
+
+      # Storage (MinIO)
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_URL: https://${MINIO_DOMAIN:-minio.${DOMAIN}}
+      S3_FORCE_PATH_STYLE: "true"
+      B2_BUCKET_NAME: ${S3_BUCKET_NAME}
+      B2_REGION: us-east-1
+      B2_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      B2_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+
+      # Frontend URL for CORS
+      FRONTEND_URL: https://${DOMAIN}
+      ALLOWED_ORIGINS: https://${DOMAIN},https://www.${DOMAIN}
+      COOKIE_DOMAIN: ${DOMAIN}
+
+      # JWT & Security
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_SECRET_KEY: ${ADMIN_SECRET_KEY}
+    env_file:
+      - .env.prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/healthz"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - cooly-network
+    restart: unless-stopped
+    labels:
+      # Traefik routing for Backend API
+      - "traefik.enable=true"
+      - "traefik.http.routers.backend.rule=Host(`${API_DOMAIN:-api.${DOMAIN}}`)"
+      - "traefik.http.routers.backend.entrypoints=websecure"
+      - "traefik.http.routers.backend.tls.certresolver=letsencrypt"
+      - "traefik.http.services.backend.loadbalancer.server.port=5000"
+
+  # Frontend (Next.js)
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE: https://${API_DOMAIN:-api.${DOMAIN}}
+        NEXT_PUBLIC_MOCK_API: "false"
+        NODE_ENV: production
+    container_name: cooly-frontend-prod
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      NEXT_PUBLIC_API_BASE: https://${API_DOMAIN:-api.${DOMAIN}}
+    env_file:
+      - .env.prod
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - cooly-network
+    restart: unless-stopped
+    labels:
+      # Traefik routing for Frontend
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(`${DOMAIN}`) || Host(`www.${DOMAIN}`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
+      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
+      # Redirect www to non-www
+      - "traefik.http.middlewares.redirect-www.redirectregex.regex=^https://www\\.(.+)"
+      - "traefik.http.middlewares.redirect-www.redirectregex.replacement=https://$${1}"
+      - "traefik.http.middlewares.redirect-www.redirectregex.permanent=true"
+      - "traefik.http.routers.frontend.middlewares=redirect-www"
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+
+networks:
+  cooly-network:
+    driver: bridge

@@ -1,0 +1,63 @@
+name: Copy Supabase DB prod -> preview
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ preview ]
+    # We'll guard actual execution by commit message to avoid running on every push
+
+jobs:
+  copy:
+    # Run if manually dispatched OR if commit message contains the tag
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[db-copy]')
+    runs-on: macos-latest
+    env:
+      PGSSLMODE: require
+      PROD_URL: ${{ secrets.PROD_URL }}
+      PREVIEW_URL: ${{ secrets.PREVIEW_URL }}
+    steps:
+      - name: Checkout (no code needed, but keeps workspace standard)
+        uses: actions/checkout@v4
+
+      - name: Install Postgres client (libpq)
+        run: |
+          brew update
+          brew install libpq
+          echo "$(brew --prefix libpq)/bin" >> $GITHUB_PATH
+
+      - name: Sanity check URLs
+        run: |
+          if [ -z "$PROD_URL" ] || [ -z "$PREVIEW_URL" ]; then
+            echo "PROD_URL or PREVIEW_URL not set" >&2; exit 1; fi
+
+      - name: Resolve IPs (IPv4 preferred, fallback IPv6) and build URLs with hostaddr
+        id: resolve
+        run: |
+          set -euo pipefail
+          PROD_HOST=$(echo "$PROD_URL"    | sed -E 's|.*@([^:/?]+).*|\1|')
+          PREV_HOST=$(echo "$PREVIEW_URL" | sed -E 's|.*@([^:/?]+).*|\1|')
+          PYONE="import socket,sys;h=sys.argv[1];ips=socket.getaddrinfo(h,5432);v4=[a[4][0] for a in ips if ':' not in a[4][0]];v6=[a[4][0] for a in ips if ':' in a[4][0]];print(v4[0] if v4 else (v6[0] if v6 else ''))"
+          PROD_IP=$(python3 -c "$PYONE" "$PROD_HOST") || true
+          PREVIEW_IP=$(python3 -c "$PYONE" "$PREV_HOST") || true
+          if [ -z "${PROD_IP:-}" ] || [ -z "${PREVIEW_IP:-}" ]; then
+            echo "Could not resolve IPs for $PROD_HOST / $PREV_HOST" >&2; exit 1; fi
+
+          if [[ "$PROD_URL" == *\?* ]]; then PROD_SEP='&'; else PROD_SEP='?'; fi
+          if [[ "$PREVIEW_URL" == *\?* ]]; then PREVIEW_SEP='&'; else PREVIEW_SEP='?'; fi
+          echo "PROD_URL_IP=${PROD_URL}${PROD_SEP}hostaddr=${PROD_IP}" >> $GITHUB_OUTPUT
+          echo "PREVIEW_URL_IP=${PREVIEW_URL}${PREVIEW_SEP}hostaddr=${PREVIEW_IP}" >> $GITHUB_OUTPUT
+
+      - name: Dump from prod (custom format)
+        run: |
+          pg_dump --format=custom --no-owner --no-privileges "${{ steps.resolve.outputs.PROD_URL_IP }}" -f dump.dump
+
+      - name: Restore into preview
+        run: |
+          pg_restore --no-owner --no-privileges --clean --if-exists -j 4 -d "${{ steps.resolve.outputs.PREVIEW_URL_IP }}" dump.dump
+
+      - name: Verify
+        run: |
+          psql "${{ steps.resolve.outputs.PREVIEW_URL_IP }}" -c "select now();"
+          psql "${{ steps.resolve.outputs.PREVIEW_URL_IP }}" -c "select table_schema, table_name from information_schema.tables where table_schema='public' order by 1,2 limit 50;"
+
+

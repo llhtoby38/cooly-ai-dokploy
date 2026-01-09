@@ -1,0 +1,83 @@
+OpenAI Sora 2 — Text-to-Video
+API Endpoints
+Submit Task & Query Result
+cURLPythonJavaScript
+
+# Submit the task
+curl --location --request POST "https://api.wavespeed.ai/api/v3/openai/sora-2/text-to-video" \
+--header "Content-Type: application/json" \
+--header "Authorization: Bearer ${WAVESPEED_API_KEY}" \
+--data-raw '{
+    "size": "720*1280",
+    "duration": 4
+}'
+
+# Get the result
+curl --location --request GET "https://api.wavespeed.ai/api/v3/predictions/${requestId}/result" \
+--header "Authorization: Bearer ${WAVESPEED_API_KEY}"
+Parameters
+Task Submission Parameters
+Request Parameters
+Parameter	Type	Required	Default	Range	Description
+prompt	string	Yes		-	The positive prompt for the generation.
+size	string	No	720*1280	720*1280, 1280*720	The size of the generated media in pixels (width*height).
+duration	integer	No	4	4, 8, 12	The duration of the generated video in seconds.
+Response Parameters
+Parameter	Type	Description
+code	integer	HTTP status code (e.g., 200 for success)
+message	string	Status message (e.g., “success”)
+data.id	string	Unique identifier for the prediction, Task Id
+data.model	string	Model ID used for the prediction
+data.outputs	array	Array of URLs to the generated content (empty when status is not completed)
+data.urls	object	Object containing related API endpoints
+data.urls.get	string	URL to retrieve the prediction result
+data.has_nsfw_contents	array	Array of boolean values indicating NSFW detection for each output
+data.status	string	Status of the task: created, processing, completed, or failed
+data.created_at	string	ISO timestamp of when the request was created (e.g., “2023-04-01T12:34:56.789Z”)
+data.error	string	Error message (empty if no error occurred)
+data.timings	object	Object containing timing details
+data.timings.inference	integer	Inference time in milliseconds
+Result Request Parameters
+
+OpenAI Sora 2 — Text-to-Video-Pro
+Authentication
+For authentication details, please refer to the Authentication Guide.
+
+API Endpoints
+Submit Task & Query Result
+cURLPythonJavaScript
+
+# Submit the task
+curl --location --request POST "https://api.wavespeed.ai/api/v3/openai/sora-2/text-to-video-pro" \
+--header "Content-Type: application/json" \
+--header "Authorization: Bearer ${WAVESPEED_API_KEY}" \
+--data-raw '{
+    "size": "720*1280",
+    "duration": 4
+}'
+
+# Get the result
+curl --location --request GET "https://api.wavespeed.ai/api/v3/predictions/${requestId}/result" \
+--header "Authorization: Bearer ${WAVESPEED_API_KEY}"
+Parameters
+Task Submission Parameters
+Request Parameters
+Parameter	Type	Required	Default	Range	Description
+prompt	string	Yes		-	The positive prompt for the generation.
+size	string	No	720*1280	720*1280, 1280*720, 1024*1792, 1792*1024	The size of the generated media in pixels (width*height).
+duration	integer	No	4	4, 8, 12	The duration of the generated video in seconds.
+Response Parameters
+Parameter	Type	Description
+code	integer	HTTP status code (e.g., 200 for success)
+message	string	Status message (e.g., “success”)
+data.id	string	Unique identifier for the prediction, Task Id
+data.model	string	Model ID used for the prediction
+data.outputs	array	Array of URLs to the generated content (empty when status is not completed)
+data.urls	object	Object containing related API endpoints
+data.urls.get	string	URL to retrieve the prediction result
+data.has_nsfw_contents	array	Array of boolean values indicating NSFW detection for each output
+data.status	string	Status of the task: created, processing, completed, or failed
+data.created_at	string	ISO timestamp of when the request was created (e.g., “2023-04-01T12:34:56.789Z”)
+data.error	string	Error message (empty if no error occurred)
+data.timings	object	Object containing timing details
+data.timings.inference	integer	Inference time in milliseconds

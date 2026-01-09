@@ -1,0 +1,68 @@
+name: Copy Supabase DB prod -> testing
+
+on:
+  workflow_dispatch:
+    inputs:
+      prod_url:
+        description: "Override PROD_URL secret (optional)"
+        required: false
+        default: ""
+      testdev_url:
+        description: "Override TESTDEV_URL secret (optional)"
+        required: false
+        default: ""
+
+jobs:
+  copy:
+    # Run if manually dispatched OR if commit message contains the tag
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[db-copy]')
+    runs-on: macos-latest
+    env:
+      PGSSLMODE: require
+      PROD_URL: ${{ secrets.PROD_URL }}
+      TESTDEV_URL: ${{ secrets.TESTDEV_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Postgres client (libpq)
+        run: |
+          brew update
+          brew install libpq
+          echo "$(brew --prefix libpq)/bin" >> $GITHUB_PATH
+
+      - name: Prepare URLs (inputs override secrets)
+        id: urls
+        run: |
+          set -euo pipefail
+          IN_PROD='${{ github.event.inputs.prod_url }}'
+          IN_TEST='${{ github.event.inputs.testdev_url }}'
+          PROD_EFF="$PROD_URL"; TEST_EFF="$TESTDEV_URL"
+          if [ -n "$IN_PROD" ]; then PROD_EFF="$IN_PROD"; fi
+          if [ -n "$IN_TEST" ]; then TEST_EFF="$IN_TEST"; fi
+          if [ -z "$PROD_EFF" ] || [ -z "$TEST_EFF" ]; then echo 'Missing PROD or TESTDEV URL' >&2; exit 1; fi
+          echo "PROD=$PROD_EFF" >> $GITHUB_OUTPUT
+          echo "TESTDEV=$TEST_EFF" >> $GITHUB_OUTPUT
+
+      - name: Connectivity check
+        run: |
+          echo "Using PROD=${{ steps.urls.outputs.PROD }}"
+          echo "Using TESTDEV=${{ steps.urls.outputs.TESTDEV }}"
+          psql "${{ steps.urls.outputs.PROD }}" -c "select now();"
+
+      - name: Dump from prod (custom format)
+        run: |
+          pg_dump --format=custom --no-owner --no-privileges "${{ steps.urls.outputs.PROD }}" -f dump.dump
+
+      - name: Restore into testing
+        run: |
+          pg_restore --no-owner --no-privileges --clean --if-exists -j 4 -d "${{ steps.urls.outputs.TESTDEV }}" dump.dump
+
+      - name: Verify
+        run: |
+          psql "${{ steps.urls.outputs.TESTDEV }}" -c "select now();"
+          psql "${{ steps.urls.outputs.TESTDEV }}" -c "select table_schema, table_name from information_schema.tables where table_schema='public' order by 1,2 limit 50;"
+
+ 
+
+

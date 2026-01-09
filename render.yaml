@@ -1,0 +1,33 @@
+# render.yaml — Blueprint for Render
+# FULL-REPO trigger: rootDir set to '.' so *any* commit (docs, frontend, etc.)
+# redeploys the backend preview, keeping it in sync with the Vercel preview.
+
+previews:
+  generation: automatic   # every PR gets a preview backend automatically
+  autoDeploy: true        # redeploy preview on each push to the PR branch
+
+services:
+  - type: web
+    name: cooly-ai-api     # must match existing service name in Render
+    runtime: node
+
+    # We build & run from the repo root, but the actual code is in ./backend
+    rootDir: .
+    buildCommand: cd backend && npm install
+    startCommand: cd backend && npm start
+
+    previews:
+      plan: starter         # cheaper instance size for previews
+    envVarGroups:
+      - cooly-shared
+
+  - type: worker
+    name: gen-worker
+    runtime: node
+    rootDir: .
+    buildCommand: cd backend && npm install
+    startCommand: cd backend && node src/queue/genWorker.js
+    previews:
+      plan: starter
+    envVarGroups:
+      - cooly-shared
