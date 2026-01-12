@@ -224,7 +224,22 @@ BEGIN
 END $$;
 
 -- ============================================================
--- 10. Create credit lots for users who have credits but no lots
+-- 10. Add provider column to sora_video_sessions
+-- ============================================================
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+        AND table_name = 'sora_video_sessions'
+        AND column_name = 'provider'
+    ) THEN
+        ALTER TABLE public.sora_video_sessions ADD COLUMN provider TEXT;
+    END IF;
+END $$;
+
+-- ============================================================
+-- 11. Create credit lots for users who have credits but no lots
 -- ============================================================
 INSERT INTO credit_lots (user_id, source, amount, remaining, expires_at)
 SELECT

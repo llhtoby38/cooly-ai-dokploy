@@ -640,6 +640,7 @@ CREATE TABLE IF NOT EXISTS public.sora_video_sessions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   prompt TEXT NOT NULL,
+  provider TEXT,
   model TEXT,
   aspect_ratio TEXT,
   resolution TEXT,
@@ -686,6 +687,11 @@ END $$;
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='sora_video_sessions' AND column_name='reservation_id') THEN
         ALTER TABLE sora_video_sessions ADD COLUMN reservation_id UUID;
+    END IF;
+END $$;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='sora_video_sessions' AND column_name='provider') THEN
+        ALTER TABLE sora_video_sessions ADD COLUMN provider TEXT;
     END IF;
 END $$;
 
