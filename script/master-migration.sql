@@ -765,6 +765,13 @@ CREATE TABLE IF NOT EXISTS public.sora_video_pricing (
   UNIQUE (model_key, resolution)
 );
 
+-- Add unique constraint for existing tables
+DO $$ BEGIN
+    ALTER TABLE sora_video_pricing ADD CONSTRAINT ux_sora_video_pricing_model_resolution UNIQUE (model_key, resolution);
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Constraint already exists: %', SQLERRM;
+END $$;
+
 -- Add missing column
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='sora_video_pricing' AND column_name='credits_per_second') THEN
@@ -848,6 +855,13 @@ CREATE TABLE IF NOT EXISTS public.veo31_video_pricing (
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE (model_key, resolution, aspect_ratio)
 );
+
+-- Add unique constraint for existing tables
+DO $$ BEGIN
+    ALTER TABLE veo31_video_pricing ADD CONSTRAINT ux_veo31_video_pricing_model_res_ar UNIQUE (model_key, resolution, aspect_ratio);
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Constraint already exists: %', SQLERRM;
+END $$;
 
 -- Seed Veo31 pricing
 INSERT INTO veo31_video_pricing (model_key, resolution, aspect_ratio, price_per_second, credits_per_second)
