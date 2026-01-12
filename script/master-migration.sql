@@ -765,12 +765,8 @@ CREATE TABLE IF NOT EXISTS public.sora_video_pricing (
   UNIQUE (model_key, resolution)
 );
 
--- Add unique constraint for existing tables
-DO $$ BEGIN
-    ALTER TABLE sora_video_pricing ADD CONSTRAINT ux_sora_video_pricing_model_resolution UNIQUE (model_key, resolution);
-EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'Constraint already exists: %', SQLERRM;
-END $$;
+-- Add unique index for existing tables
+SELECT safe_create_index('CREATE UNIQUE INDEX IF NOT EXISTS ux_sora_video_pricing_model_resolution ON sora_video_pricing(model_key, resolution)');
 
 -- Add missing column
 DO $$ BEGIN
@@ -856,12 +852,8 @@ CREATE TABLE IF NOT EXISTS public.veo31_video_pricing (
   UNIQUE (model_key, resolution, aspect_ratio)
 );
 
--- Add unique constraint for existing tables
-DO $$ BEGIN
-    ALTER TABLE veo31_video_pricing ADD CONSTRAINT ux_veo31_video_pricing_model_res_ar UNIQUE (model_key, resolution, aspect_ratio);
-EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'Constraint already exists: %', SQLERRM;
-END $$;
+-- Add unique index for existing tables
+SELECT safe_create_index('CREATE UNIQUE INDEX IF NOT EXISTS ux_veo31_video_pricing_model_res_ar ON veo31_video_pricing(model_key, resolution, aspect_ratio)');
 
 -- Seed Veo31 pricing
 INSERT INTO veo31_video_pricing (model_key, resolution, aspect_ratio, price_per_second, credits_per_second)
@@ -1254,20 +1246,7 @@ CREATE TABLE IF NOT EXISTS public.subscription_plans (
   UNIQUE (plan_key, billing_mode)
 );
 
--- Add unique constraint if table already exists without it
-DO $$ BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conrelid = 'subscription_plans'::regclass
-        AND contype = 'u'
-        AND conname LIKE '%plan_key%'
-    ) THEN
-        ALTER TABLE subscription_plans ADD CONSTRAINT ux_subscription_plans_plan_key_billing_mode UNIQUE (plan_key, billing_mode);
-    END IF;
-EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'Unique constraint already exists or cannot be added: %', SQLERRM;
-END $$;
-
+-- Add unique index for existing tables
 SELECT safe_create_index('CREATE UNIQUE INDEX IF NOT EXISTS ux_subscription_plans_key_mode ON subscription_plans (plan_key, billing_mode)');
 SELECT safe_create_index('CREATE INDEX IF NOT EXISTS idx_subscription_plans_stripe_price ON subscription_plans (stripe_price_id)');
 
@@ -1309,12 +1288,8 @@ CREATE TABLE IF NOT EXISTS public.credit_packages (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Add unique constraint for existing tables
-DO $$ BEGIN
-    ALTER TABLE credit_packages ADD CONSTRAINT ux_credit_packages_display_name UNIQUE (display_name);
-EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'Unique constraint already exists: %', SQLERRM;
-END $$;
+-- Add unique index for existing tables (CREATE INDEX IF NOT EXISTS is safer than ADD CONSTRAINT)
+SELECT safe_create_index('CREATE UNIQUE INDEX IF NOT EXISTS ux_credit_packages_display_name ON credit_packages(display_name)');
 
 INSERT INTO credit_packages (display_name, credits, price_cents, sort_order)
 VALUES
@@ -1337,12 +1312,8 @@ CREATE TABLE IF NOT EXISTS public.model_pricing (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Add unique constraint for existing tables
-DO $$ BEGIN
-    ALTER TABLE model_pricing ADD CONSTRAINT ux_model_pricing_model_key UNIQUE (model_key);
-EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'Unique constraint already exists: %', SQLERRM;
-END $$;
+-- Add unique index for existing tables
+SELECT safe_create_index('CREATE UNIQUE INDEX IF NOT EXISTS ux_model_pricing_model_key ON model_pricing(model_key)');
 
 SELECT safe_create_index('CREATE UNIQUE INDEX IF NOT EXISTS ux_model_pricing_model_key ON model_pricing(model_key)');
 
