@@ -66,24 +66,32 @@ CREATE TABLE IF NOT EXISTS public.credit_lots (
   closed_at timestamptz NULL
 );
 
--- 1.2 Add check constraint if not exists (ignore error if exists)
+-- 1.2 Fix any invalid data before adding constraints
+UPDATE public.credit_lots SET source = 'adjustment' WHERE source IS NULL OR source NOT IN ('subscription','one_off','adjustment');
+UPDATE public.credit_lots SET amount = 0 WHERE amount IS NULL OR amount < 0;
+UPDATE public.credit_lots SET remaining = 0 WHERE remaining IS NULL OR remaining < 0;
+
+-- 1.3 Add check constraints (ignore if exists or still violates)
 DO $$ BEGIN
     ALTER TABLE public.credit_lots ADD CONSTRAINT credit_lots_source_check
         CHECK (source IN ('subscription','one_off','adjustment'));
 EXCEPTION WHEN duplicate_object THEN NULL;
+         WHEN check_violation THEN NULL;
 END $$;
 
 DO $$ BEGIN
     ALTER TABLE public.credit_lots ADD CONSTRAINT credit_lots_amount_check CHECK (amount >= 0);
 EXCEPTION WHEN duplicate_object THEN NULL;
+         WHEN check_violation THEN NULL;
 END $$;
 
 DO $$ BEGIN
     ALTER TABLE public.credit_lots ADD CONSTRAINT credit_lots_remaining_check CHECK (remaining >= 0);
 EXCEPTION WHEN duplicate_object THEN NULL;
+         WHEN check_violation THEN NULL;
 END $$;
 
--- 1.3 Credit lots indexes
+-- 1.4 Credit lots indexes
 CREATE INDEX IF NOT EXISTS idx_credit_lots_user_expires
   ON public.credit_lots(user_id, expires_at) WHERE closed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_credit_lots_user_remaining
@@ -164,19 +172,26 @@ CREATE TABLE IF NOT EXISTS public.credit_reservations (
   released_at timestamptz
 );
 
--- 3.2 Add check constraints
+-- 3.2 Fix any invalid status values before adding constraint
+UPDATE public.credit_reservations
+SET status = 'released'
+WHERE status IS NULL OR status NOT IN ('pending', 'captured', 'released');
+
+-- 3.3 Add check constraints (with data cleanup)
 DO $$ BEGIN
     ALTER TABLE public.credit_reservations ADD CONSTRAINT credit_reservations_amount_check CHECK (amount > 0);
 EXCEPTION WHEN duplicate_object THEN NULL;
+         WHEN check_violation THEN NULL;
 END $$;
 
 DO $$ BEGIN
     ALTER TABLE public.credit_reservations ADD CONSTRAINT credit_reservations_status_check
         CHECK (status IN ('pending','captured','released'));
 EXCEPTION WHEN duplicate_object THEN NULL;
+         WHEN check_violation THEN NULL;
 END $$;
 
--- 3.3 Credit reservations indexes
+-- 3.4 Credit reservations indexes
 CREATE INDEX IF NOT EXISTS idx_credit_reservations_user
   ON public.credit_reservations(user_id) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_credit_reservations_session
@@ -188,7 +203,7 @@ CREATE INDEX IF NOT EXISTS idx_credit_reservations_pending_expires
 CREATE INDEX IF NOT EXISTS idx_credit_reservations_user_pending
   ON public.credit_reservations(user_id, created_at DESC) WHERE status = 'pending';
 
--- 3.4 Add FK from credit_transactions to credit_reservations
+-- 3.5 Add FK from credit_transactions to credit_reservations
 DO $$ BEGIN
     ALTER TABLE public.credit_transactions
         ADD CONSTRAINT credit_transactions_reservation_id_fkey
