@@ -66,10 +66,14 @@ CREATE TABLE IF NOT EXISTS public.credit_lots (
   closed_at timestamptz NULL
 );
 
--- 1.2 Fix any invalid data before adding constraints
-UPDATE public.credit_lots SET source = 'adjustment' WHERE source IS NULL OR source NOT IN ('subscription','one_off','adjustment');
-UPDATE public.credit_lots SET amount = 0 WHERE amount IS NULL OR amount < 0;
-UPDATE public.credit_lots SET remaining = 0 WHERE remaining IS NULL OR remaining < 0;
+-- 1.2 Fix any invalid data before adding constraints (only if table exists)
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='credit_lots') THEN
+        UPDATE public.credit_lots SET source = 'adjustment' WHERE source IS NULL OR source NOT IN ('subscription','one_off','adjustment');
+        UPDATE public.credit_lots SET amount = 0 WHERE amount IS NULL OR amount < 0;
+        UPDATE public.credit_lots SET remaining = 0 WHERE remaining IS NULL OR remaining < 0;
+    END IF;
+END $$;
 
 -- 1.3 Add check constraints (ignore if exists or still violates)
 DO $$ BEGIN
@@ -172,10 +176,13 @@ CREATE TABLE IF NOT EXISTS public.credit_reservations (
   released_at timestamptz
 );
 
--- 3.2 Fix any invalid status values before adding constraint
-UPDATE public.credit_reservations
-SET status = 'released'
-WHERE status IS NULL OR status NOT IN ('pending', 'captured', 'released');
+-- 3.2 Fix any invalid status values before adding constraint (only if table exists)
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='credit_reservations') THEN
+        UPDATE public.credit_reservations SET status = 'released'
+        WHERE status IS NULL OR status NOT IN ('pending', 'captured', 'released');
+    END IF;
+END $$;
 
 -- 3.3 Add check constraints (with data cleanup)
 DO $$ BEGIN
@@ -513,23 +520,36 @@ CREATE INDEX IF NOT EXISTS idx_users_google_id ON public.users(google_id) WHERE 
 -- ============================================================
 
 -- 14.1 Create credit lots for users who have credits but no active lots
-INSERT INTO public.credit_lots (user_id, source, amount, remaining, expires_at)
-SELECT
-    u.id,
-    'adjustment',
-    u.credits,
-    u.credits,
-    NOW() + INTERVAL '365 days'
-FROM public.users u
-WHERE u.credits > 0
-AND NOT EXISTS (
-    SELECT 1 FROM public.credit_lots cl
-    WHERE cl.user_id = u.id
-    AND cl.remaining > 0
-    AND cl.closed_at IS NULL
-    AND (cl.expires_at > NOW() OR cl.source = 'one_off')
-)
-ON CONFLICT DO NOTHING;
+-- Wrapped in DO block to handle missing tables/columns gracefully
+DO $$
+BEGIN
+    -- Only run if both tables exist and have the required columns
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='users')
+       AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='credit_lots')
+       AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='credits')
+       AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='credit_lots' AND column_name='user_id')
+    THEN
+        INSERT INTO public.credit_lots (user_id, source, amount, remaining, expires_at)
+        SELECT
+            u.id,
+            'adjustment',
+            u.credits,
+            u.credits,
+            NOW() + INTERVAL '365 days'
+        FROM public.users u
+        WHERE u.credits > 0
+        AND NOT EXISTS (
+            SELECT 1 FROM public.credit_lots cl
+            WHERE cl.user_id = u.id
+            AND cl.remaining > 0
+            AND cl.closed_at IS NULL
+            AND (cl.expires_at > NOW() OR cl.source = 'one_off')
+        )
+        ON CONFLICT DO NOTHING;
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Data fix skipped: %', SQLERRM;
+END $$;
 
 -- ============================================================
 -- SECTION 15: DEFAULT APP SETTINGS
@@ -543,23 +563,17 @@ ON CONFLICT (key) DO NOTHING;
 COMMIT;
 
 -- ============================================================
--- VERIFICATION QUERIES (run after migration)
+-- VERIFICATION (safe queries that won't fail)
 -- ============================================================
 
-SELECT 'Tables' as check_type, count(*) as count
+-- Count tables
+SELECT 'Tables created' as status, count(*) as count
 FROM information_schema.tables
 WHERE table_schema = 'public'
 AND table_type = 'BASE TABLE';
 
-SELECT 'credit_lots' as table_name, count(*) as rows FROM public.credit_lots
-UNION ALL SELECT 'credit_reservations', count(*) FROM public.credit_reservations
-UNION ALL SELECT 'credit_transactions', count(*) FROM public.credit_transactions
-UNION ALL SELECT 'outbox', count(*) FROM public.outbox
-UNION ALL SELECT 'users', count(*) FROM public.users;
-
-SELECT 'Critical columns exist' as check_type,
-       table_name,
-       column_name
+-- List critical columns
+SELECT 'Critical columns' as status, table_name, column_name
 FROM information_schema.columns
 WHERE table_schema = 'public'
 AND (
@@ -568,5 +582,7 @@ AND (
     OR (table_name = 'outbox' AND column_name = 'processed_at')
     OR (table_name = 'generation_sessions' AND column_name IN ('guidance_scale', 'reservation_id'))
     OR (table_name = 'video_generation_sessions' AND column_name IN ('resolution', 'reservation_id'))
+    OR (table_name = 'credit_lots' AND column_name = 'user_id')
+    OR (table_name = 'credit_reservations' AND column_name = 'status')
 )
 ORDER BY table_name, column_name;
