@@ -1509,6 +1509,23 @@ SELECT safe_create_index('CREATE INDEX IF NOT EXISTS idx_sora_sessions_user_crea
 SELECT safe_create_index('CREATE INDEX IF NOT EXISTS idx_veo31_sessions_user_created ON veo31_video_sessions(user_id, created_at DESC) WHERE status = ''completed''');
 
 -- ============================================================
+-- SECTION 33: ADMIN USER SETUP
+-- ============================================================
+
+-- Create admin user if not exists (password is checked against ADMIN_PASSWORD env var)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM users WHERE lower(email) = 'admin@cooly.ai') THEN
+        INSERT INTO users (email, role, credits, created_at)
+        VALUES ('admin@cooly.ai', 'admin', 0, NOW());
+        RAISE NOTICE 'Admin user created: admin@cooly.ai';
+    ELSE
+        UPDATE users SET role = 'admin' WHERE lower(email) = 'admin@cooly.ai' AND role != 'admin';
+        RAISE NOTICE 'Admin user already exists, ensured role is admin';
+    END IF;
+END $$;
+
+-- ============================================================
 -- CLEANUP
 -- ============================================================
 
