@@ -2,8 +2,7 @@
 -- COOLY AI - MASTER MIGRATION SCRIPT
 -- ============================================================
 -- This script is IDEMPOTENT - safe to run multiple times
--- Includes all schema changes from the performance optimization
--- and containerization contract work.
+-- Can initialize a fresh database OR update existing databases
 --
 -- Run via: psql $DATABASE_URL -f script/master-migration.sql
 -- Or paste into Supabase SQL Editor
@@ -12,313 +11,426 @@
 BEGIN;
 
 -- ============================================================
+-- SECTION 0: BASE TABLES (if not exist)
+-- These are the core tables that other tables depend on
+-- ============================================================
+
+-- 0.1 Users table (core - required for foreign keys)
+CREATE TABLE IF NOT EXISTS public.users (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  email text UNIQUE NOT NULL,
+  password_hash text,
+  role text DEFAULT 'user',
+  credits integer NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz DEFAULT now(),
+  last_login timestamptz,
+  deleted_at timestamptz,
+  google_id text
+);
+
+-- 0.2 Add any missing columns to users
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='role') THEN
+        ALTER TABLE public.users ADD COLUMN role text DEFAULT 'user';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='credits') THEN
+        ALTER TABLE public.users ADD COLUMN credits integer NOT NULL DEFAULT 0;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='last_login') THEN
+        ALTER TABLE public.users ADD COLUMN last_login timestamptz;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='deleted_at') THEN
+        ALTER TABLE public.users ADD COLUMN deleted_at timestamptz;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='google_id') THEN
+        ALTER TABLE public.users ADD COLUMN google_id text;
+    END IF;
+END $$;
+
+-- ============================================================
 -- SECTION 1: CREDIT LOTS SYSTEM
--- From: 016_credit_lots.sql
 -- ============================================================
 
 -- 1.1 Create credit_lots table
 CREATE TABLE IF NOT EXISTS public.credit_lots (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-  source text NOT NULL CHECK (source IN ('subscription','one_off','adjustment')),
+  source text NOT NULL,
   plan_key text NULL,
   cycle_start timestamptz NULL,
-  amount integer NOT NULL CHECK (amount >= 0),
-  remaining integer NOT NULL CHECK (remaining >= 0),
-  expires_at timestamptz NOT NULL,
+  amount integer NOT NULL DEFAULT 0,
+  remaining integer NOT NULL DEFAULT 0,
+  expires_at timestamptz NOT NULL DEFAULT (now() + interval '365 days'),
   created_at timestamptz NOT NULL DEFAULT now(),
   closed_at timestamptz NULL
 );
 
--- 1.2 Credit lots indexes
+-- 1.2 Add check constraint if not exists (ignore error if exists)
+DO $$ BEGIN
+    ALTER TABLE public.credit_lots ADD CONSTRAINT credit_lots_source_check
+        CHECK (source IN ('subscription','one_off','adjustment'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE public.credit_lots ADD CONSTRAINT credit_lots_amount_check CHECK (amount >= 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE public.credit_lots ADD CONSTRAINT credit_lots_remaining_check CHECK (remaining >= 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- 1.3 Credit lots indexes
 CREATE INDEX IF NOT EXISTS idx_credit_lots_user_expires
   ON public.credit_lots(user_id, expires_at) WHERE closed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_credit_lots_user_remaining
   ON public.credit_lots(user_id) WHERE remaining > 0 AND closed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_credit_lots_user_active
+  ON public.credit_lots(user_id) WHERE remaining > 0 AND closed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_credit_lots_expires_remaining
+  ON public.credit_lots(expires_at, remaining) WHERE closed_at IS NULL;
 
--- 1.3 Add lot_id to credit_transactions
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'credit_transactions'
-        AND column_name = 'lot_id'
-    ) THEN
-        ALTER TABLE public.credit_transactions ADD COLUMN lot_id uuid REFERENCES public.credit_lots(id);
+-- ============================================================
+-- SECTION 2: CREDIT TRANSACTIONS
+-- ============================================================
+
+-- 2.1 Create credit_transactions table if not exists
+CREATE TABLE IF NOT EXISTS public.credit_transactions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  amount integer NOT NULL,
+  balance_after integer,
+  type text NOT NULL,
+  description text,
+  reference_id text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- 2.2 Add lot_id column
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='credit_transactions' AND column_name='lot_id') THEN
+        ALTER TABLE public.credit_transactions ADD COLUMN lot_id uuid;
     END IF;
 END $$;
 
--- 1.4 Add expires_at to credit_transactions
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'credit_transactions'
-        AND column_name = 'expires_at'
-    ) THEN
+-- 2.3 Add foreign key for lot_id (ignore if exists)
+DO $$ BEGIN
+    ALTER TABLE public.credit_transactions
+        ADD CONSTRAINT credit_transactions_lot_id_fkey
+        FOREIGN KEY (lot_id) REFERENCES public.credit_lots(id);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- 2.4 Add expires_at column
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='credit_transactions' AND column_name='expires_at') THEN
         ALTER TABLE public.credit_transactions ADD COLUMN expires_at timestamptz;
     END IF;
 END $$;
 
--- 1.5 Index for lot_id lookups
+-- 2.5 Add reservation_id column (will add FK after credit_reservations table)
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='credit_transactions' AND column_name='reservation_id') THEN
+        ALTER TABLE public.credit_transactions ADD COLUMN reservation_id uuid;
+    END IF;
+END $$;
+
+-- 2.6 Credit transactions indexes
 CREATE INDEX IF NOT EXISTS idx_credit_transactions_lot_id
   ON public.credit_transactions(lot_id) WHERE lot_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_credit_transactions_user_created
+  ON public.credit_transactions(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_credit_transactions_reservation
+  ON public.credit_transactions(reservation_id) WHERE reservation_id IS NOT NULL;
 
 -- ============================================================
--- SECTION 2: CREDIT RESERVATIONS SYSTEM
--- From: 024_credit_reservations.sql, 20251031 migrations
+-- SECTION 3: CREDIT RESERVATIONS SYSTEM
 -- ============================================================
 
--- 2.1 Create credit_reservations table
+-- 3.1 Create credit_reservations table
 CREATE TABLE IF NOT EXISTS public.credit_reservations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
   session_id uuid,
   session_type text,
-  amount integer NOT NULL CHECK (amount > 0),
-  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','captured','released')),
+  amount integer NOT NULL DEFAULT 1,
+  status text NOT NULL DEFAULT 'pending',
   created_at timestamptz NOT NULL DEFAULT now(),
   expires_at timestamptz NOT NULL DEFAULT (now() + interval '1 hour'),
   captured_at timestamptz,
   released_at timestamptz
 );
 
--- 2.2 Credit reservations indexes
+-- 3.2 Add check constraints
+DO $$ BEGIN
+    ALTER TABLE public.credit_reservations ADD CONSTRAINT credit_reservations_amount_check CHECK (amount > 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE public.credit_reservations ADD CONSTRAINT credit_reservations_status_check
+        CHECK (status IN ('pending','captured','released'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- 3.3 Credit reservations indexes
 CREATE INDEX IF NOT EXISTS idx_credit_reservations_user
   ON public.credit_reservations(user_id) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_credit_reservations_session
   ON public.credit_reservations(session_id);
 CREATE INDEX IF NOT EXISTS idx_credit_reservations_expires
   ON public.credit_reservations(expires_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_credit_reservations_pending_expires
+  ON public.credit_reservations(expires_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_credit_reservations_user_pending
+  ON public.credit_reservations(user_id, created_at DESC) WHERE status = 'pending';
 
--- 2.3 Add reservation_id to credit_transactions
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'credit_transactions'
-        AND column_name = 'reservation_id'
-    ) THEN
-        ALTER TABLE public.credit_transactions ADD COLUMN reservation_id uuid REFERENCES public.credit_reservations(id);
-    END IF;
+-- 3.4 Add FK from credit_transactions to credit_reservations
+DO $$ BEGIN
+    ALTER TABLE public.credit_transactions
+        ADD CONSTRAINT credit_transactions_reservation_id_fkey
+        FOREIGN KEY (reservation_id) REFERENCES public.credit_reservations(id);
+EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- 2.4 Index for reservation_id lookups
-CREATE INDEX IF NOT EXISTS idx_credit_transactions_reservation
-  ON public.credit_transactions(reservation_id) WHERE reservation_id IS NOT NULL;
-
 -- ============================================================
--- SECTION 3: OUTBOX TABLE (Enqueue-First Pattern)
--- From: 20251101_create_outbox.sql
+-- SECTION 4: OUTBOX TABLE (Enqueue-First Pattern)
 -- ============================================================
 
+-- 4.1 Create outbox table
 CREATE TABLE IF NOT EXISTS public.outbox (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   event_type text NOT NULL,
-  payload jsonb NOT NULL,
+  payload jsonb NOT NULL DEFAULT '{}',
   created_at timestamptz NOT NULL DEFAULT now(),
   processed_at timestamptz,
   error text
 );
 
+-- 4.2 Add missing columns to outbox if table existed with different schema
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='outbox' AND column_name='processed_at') THEN
+        ALTER TABLE public.outbox ADD COLUMN processed_at timestamptz;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='outbox' AND column_name='error') THEN
+        ALTER TABLE public.outbox ADD COLUMN error text;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='outbox' AND column_name='event_type') THEN
+        ALTER TABLE public.outbox ADD COLUMN event_type text NOT NULL DEFAULT 'unknown';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='outbox' AND column_name='payload') THEN
+        ALTER TABLE public.outbox ADD COLUMN payload jsonb NOT NULL DEFAULT '{}';
+    END IF;
+END $$;
+
+-- 4.3 Outbox indexes
 CREATE INDEX IF NOT EXISTS idx_outbox_unprocessed
   ON public.outbox(created_at) WHERE processed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_outbox_unprocessed_created
   ON public.outbox(created_at ASC) WHERE processed_at IS NULL;
 
 -- ============================================================
--- SECTION 4: BILLING SYSTEM FIXES
--- From: 003_billing.sql
+-- SECTION 5: SUBSCRIPTIONS TABLE
 -- ============================================================
 
--- 4.1 Add billing_mode to subscriptions
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'subscriptions'
-        AND column_name = 'billing_mode'
-    ) THEN
-        ALTER TABLE public.subscriptions ADD COLUMN billing_mode TEXT;
+-- 5.1 Create subscriptions table
+CREATE TABLE IF NOT EXISTS public.subscriptions (
+  id serial PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  stripe_subscription_id text UNIQUE,
+  status text NOT NULL DEFAULT 'active',
+  plan_id text,
+  billing_mode text,
+  current_period_end timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- 5.2 Add billing_mode column if missing
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='subscriptions' AND column_name='billing_mode') THEN
+        ALTER TABLE public.subscriptions ADD COLUMN billing_mode text;
     END IF;
 END $$;
 
 -- ============================================================
--- SECTION 5: GENERATION SESSIONS COLUMNS
--- From: 20260110_fix_missing_columns.sql, 20251102, 20251230
+-- SECTION 6: GENERATION SESSIONS TABLE
 -- ============================================================
 
--- 5.1 Add guidance_scale (Seedream 4.0)
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'generation_sessions'
-        AND column_name = 'guidance_scale'
-    ) THEN
+-- 6.1 Create generation_sessions table
+CREATE TABLE IF NOT EXISTS public.generation_sessions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  prompt text,
+  status text NOT NULL DEFAULT 'pending',
+  model text,
+  provider text,
+  aspect_ratio text,
+  resolution text,
+  width integer,
+  height integer,
+  num_outputs integer DEFAULT 1,
+  credit_cost integer,
+  error_message text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz
+);
+
+-- 6.2 Add all missing columns to generation_sessions
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='generation_sessions' AND column_name='guidance_scale') THEN
         ALTER TABLE public.generation_sessions ADD COLUMN guidance_scale NUMERIC;
     END IF;
-END $$;
-
--- 5.2 Add negative_prompt (Seedream 4.0)
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'generation_sessions'
-        AND column_name = 'negative_prompt'
-    ) THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='generation_sessions' AND column_name='negative_prompt') THEN
         ALTER TABLE public.generation_sessions ADD COLUMN negative_prompt TEXT;
     END IF;
-END $$;
-
--- 5.3 Add seed (Seedream 4.0)
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'generation_sessions'
-        AND column_name = 'seed'
-    ) THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='generation_sessions' AND column_name='seed') THEN
         ALTER TABLE public.generation_sessions ADD COLUMN seed BIGINT;
     END IF;
-END $$;
-
--- 5.4 Add error_details
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'generation_sessions'
-        AND column_name = 'error_details'
-    ) THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='generation_sessions' AND column_name='error_details') THEN
         ALTER TABLE public.generation_sessions ADD COLUMN error_details JSONB;
     END IF;
-END $$;
-
--- 5.5 Add timing_breakdown
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'generation_sessions'
-        AND column_name = 'timing_breakdown'
-    ) THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='generation_sessions' AND column_name='timing_breakdown') THEN
         ALTER TABLE public.generation_sessions ADD COLUMN timing_breakdown JSONB;
     END IF;
-END $$;
-
--- 5.6 Add reservation_id to generation_sessions
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'generation_sessions'
-        AND column_name = 'reservation_id'
-    ) THEN
-        ALTER TABLE public.generation_sessions ADD COLUMN reservation_id uuid REFERENCES public.credit_reservations(id);
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='generation_sessions' AND column_name='reservation_id') THEN
+        ALTER TABLE public.generation_sessions ADD COLUMN reservation_id uuid;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='generation_sessions' AND column_name='client_key') THEN
+        ALTER TABLE public.generation_sessions ADD COLUMN client_key text;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='generation_sessions' AND column_name='input_settings') THEN
+        ALTER TABLE public.generation_sessions ADD COLUMN input_settings JSONB;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='generation_sessions' AND column_name='outputs') THEN
+        ALTER TABLE public.generation_sessions ADD COLUMN outputs JSONB;
     END IF;
 END $$;
 
+-- 6.3 Add FK for reservation_id
+DO $$ BEGIN
+    ALTER TABLE public.generation_sessions
+        ADD CONSTRAINT generation_sessions_reservation_id_fkey
+        FOREIGN KEY (reservation_id) REFERENCES public.credit_reservations(id);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- 6.4 Generation sessions indexes
+CREATE INDEX IF NOT EXISTS idx_generation_sessions_user_status
+  ON public.generation_sessions(user_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_generation_sessions_status_created
+  ON public.generation_sessions(status, created_at) WHERE status IN ('pending', 'processing');
+CREATE INDEX IF NOT EXISTS idx_generation_sessions_reservation
+  ON public.generation_sessions(reservation_id) WHERE reservation_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_generation_sessions_client_key
+  ON public.generation_sessions(client_key) WHERE client_key IS NOT NULL;
+
 -- ============================================================
--- SECTION 6: VIDEO GENERATION SESSIONS COLUMNS
--- From: 20260110_fix_missing_columns.sql
+-- SECTION 7: VIDEO GENERATION SESSIONS TABLE
 -- ============================================================
 
--- 6.1 Add resolution (Seedance, Sora2, Veo)
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'video_generation_sessions'
-        AND column_name = 'resolution'
-    ) THEN
+-- 7.1 Create video_generation_sessions table
+CREATE TABLE IF NOT EXISTS public.video_generation_sessions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  prompt text,
+  status text NOT NULL DEFAULT 'pending',
+  model text,
+  provider text,
+  aspect_ratio text,
+  duration integer,
+  credit_cost integer,
+  error_message text,
+  video_url text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz
+);
+
+-- 7.2 Add all missing columns to video_generation_sessions
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='video_generation_sessions' AND column_name='resolution') THEN
         ALTER TABLE public.video_generation_sessions ADD COLUMN resolution TEXT;
     END IF;
-END $$;
-
--- 6.2 Add video_duration
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'video_generation_sessions'
-        AND column_name = 'video_duration'
-    ) THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='video_generation_sessions' AND column_name='video_duration') THEN
         ALTER TABLE public.video_generation_sessions ADD COLUMN video_duration INTEGER;
     END IF;
-END $$;
-
--- 6.3 Add provider_status (Veo)
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'video_generation_sessions'
-        AND column_name = 'provider_status'
-    ) THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='video_generation_sessions' AND column_name='provider_status') THEN
         ALTER TABLE public.video_generation_sessions ADD COLUMN provider_status TEXT;
     END IF;
-END $$;
-
--- 6.4 Add storage_status
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'video_generation_sessions'
-        AND column_name = 'storage_status'
-    ) THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='video_generation_sessions' AND column_name='storage_status') THEN
         ALTER TABLE public.video_generation_sessions ADD COLUMN storage_status TEXT;
     END IF;
-END $$;
-
--- 6.5 Add timing_breakdown to video_generation_sessions
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'video_generation_sessions'
-        AND column_name = 'timing_breakdown'
-    ) THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='video_generation_sessions' AND column_name='timing_breakdown') THEN
         ALTER TABLE public.video_generation_sessions ADD COLUMN timing_breakdown JSONB;
     END IF;
-END $$;
-
--- 6.6 Add reservation_id to video_generation_sessions
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'video_generation_sessions'
-        AND column_name = 'reservation_id'
-    ) THEN
-        ALTER TABLE public.video_generation_sessions ADD COLUMN reservation_id uuid REFERENCES public.credit_reservations(id);
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='video_generation_sessions' AND column_name='reservation_id') THEN
+        ALTER TABLE public.video_generation_sessions ADD COLUMN reservation_id uuid;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='video_generation_sessions' AND column_name='client_key') THEN
+        ALTER TABLE public.video_generation_sessions ADD COLUMN client_key text;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='video_generation_sessions' AND column_name='b2_url') THEN
+        ALTER TABLE public.video_generation_sessions ADD COLUMN b2_url text;
     END IF;
 END $$;
 
+-- 7.3 Add FK for reservation_id
+DO $$ BEGIN
+    ALTER TABLE public.video_generation_sessions
+        ADD CONSTRAINT video_generation_sessions_reservation_id_fkey
+        FOREIGN KEY (reservation_id) REFERENCES public.credit_reservations(id);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- 7.4 Video generation sessions indexes
+CREATE INDEX IF NOT EXISTS idx_video_generation_sessions_user_status
+  ON public.video_generation_sessions(user_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_video_generation_sessions_status_created
+  ON public.video_generation_sessions(status, created_at) WHERE status IN ('pending', 'processing', 'uploading');
+CREATE INDEX IF NOT EXISTS idx_video_generation_sessions_reservation
+  ON public.video_generation_sessions(reservation_id) WHERE reservation_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_video_generation_sessions_client_key
+  ON public.video_generation_sessions(client_key) WHERE client_key IS NOT NULL;
+
 -- ============================================================
--- SECTION 7: PROVIDER USAGE LOGS
--- From: 20251230_fix_provider_usage_logs_session_id.sql
+-- SECTION 8: IMAGES TABLE
 -- ============================================================
 
--- 7.1 Ensure provider_usage_logs table exists
+-- 8.1 Create images table
+CREATE TABLE IF NOT EXISTS public.images (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  session_id uuid REFERENCES public.generation_sessions(id) ON DELETE CASCADE,
+  url text,
+  b2_url text,
+  storage_status text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- 8.2 Add missing columns
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='images' AND column_name='client_key') THEN
+        ALTER TABLE public.images ADD COLUMN client_key text;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='images' AND column_name='b2_url') THEN
+        ALTER TABLE public.images ADD COLUMN b2_url text;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='images' AND column_name='storage_status') THEN
+        ALTER TABLE public.images ADD COLUMN storage_status text;
+    END IF;
+END $$;
+
+-- 8.3 Images indexes
+CREATE INDEX IF NOT EXISTS idx_images_session_id ON public.images(session_id);
+CREATE INDEX IF NOT EXISTS idx_images_user_created ON public.images(user_id, created_at DESC);
+
+-- ============================================================
+-- SECTION 9: PROVIDER USAGE LOGS
+-- ============================================================
+
+-- 9.1 Create provider_usage_logs table
 CREATE TABLE IF NOT EXISTS public.provider_usage_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   session_id uuid,
@@ -333,104 +445,14 @@ CREATE TABLE IF NOT EXISTS public.provider_usage_logs (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
--- 7.2 Fix session_id column type if needed (some deployments had varchar)
-DO $$
-BEGIN
-    -- Only run if column exists and is not uuid type
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND table_name = 'provider_usage_logs'
-        AND column_name = 'session_id'
-        AND data_type != 'uuid'
-    ) THEN
-        ALTER TABLE public.provider_usage_logs
-        ALTER COLUMN session_id TYPE uuid USING session_id::uuid;
-    END IF;
-EXCEPTION WHEN OTHERS THEN
-    -- Ignore errors if conversion fails
-    NULL;
-END $$;
-
--- ============================================================
--- SECTION 8: PERFORMANCE INDEXES
--- From: 20260101_add_performance_indexes.sql
--- ============================================================
-
--- 8.1 Credit lots indexes
-CREATE INDEX IF NOT EXISTS idx_credit_lots_user_active
-  ON public.credit_lots(user_id)
-  WHERE remaining > 0 AND closed_at IS NULL;
-
-CREATE INDEX IF NOT EXISTS idx_credit_lots_expires_remaining
-  ON public.credit_lots(expires_at, remaining)
-  WHERE closed_at IS NULL;
-
--- 8.2 Credit reservations indexes
-CREATE INDEX IF NOT EXISTS idx_credit_reservations_pending_expires
-  ON public.credit_reservations(expires_at)
-  WHERE status = 'pending';
-
-CREATE INDEX IF NOT EXISTS idx_credit_reservations_user_pending
-  ON public.credit_reservations(user_id, created_at DESC)
-  WHERE status = 'pending';
-
--- 8.3 Credit transactions indexes
-CREATE INDEX IF NOT EXISTS idx_credit_transactions_user_created
-  ON public.credit_transactions(user_id, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_credit_transactions_lot_remaining
-  ON public.credit_transactions(lot_id)
-  WHERE lot_id IS NOT NULL;
-
--- 8.4 Generation sessions indexes
-CREATE INDEX IF NOT EXISTS idx_generation_sessions_user_status
-  ON public.generation_sessions(user_id, status, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_generation_sessions_status_created
-  ON public.generation_sessions(status, created_at)
-  WHERE status IN ('pending', 'processing');
-
-CREATE INDEX IF NOT EXISTS idx_generation_sessions_reservation
-  ON public.generation_sessions(reservation_id)
-  WHERE reservation_id IS NOT NULL;
-
--- 8.5 Video generation sessions indexes
-CREATE INDEX IF NOT EXISTS idx_video_generation_sessions_user_status
-  ON public.video_generation_sessions(user_id, status, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_video_generation_sessions_status_created
-  ON public.video_generation_sessions(status, created_at)
-  WHERE status IN ('pending', 'processing', 'uploading');
-
-CREATE INDEX IF NOT EXISTS idx_video_generation_sessions_reservation
-  ON public.video_generation_sessions(reservation_id)
-  WHERE reservation_id IS NOT NULL;
-
--- 8.6 Users indexes
-CREATE INDEX IF NOT EXISTS idx_users_email_lower
-  ON public.users(lower(email));
-
-CREATE INDEX IF NOT EXISTS idx_users_created_at
-  ON public.users(created_at DESC);
-
--- 8.7 Images indexes
-CREATE INDEX IF NOT EXISTS idx_images_session_id
-  ON public.images(session_id);
-
-CREATE INDEX IF NOT EXISTS idx_images_user_created
-  ON public.images(user_id, created_at DESC);
-
--- 8.8 Provider usage logs indexes
+-- 9.2 Provider usage logs indexes
 CREATE INDEX IF NOT EXISTS idx_provider_usage_logs_session
   ON public.provider_usage_logs(session_id, session_type);
-
 CREATE INDEX IF NOT EXISTS idx_provider_usage_logs_created
   ON public.provider_usage_logs(created_at DESC);
 
 -- ============================================================
--- SECTION 9: APP SETTINGS TABLE
--- From: 024_app_settings.sql
+-- SECTION 10: APP SETTINGS TABLE
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS public.app_settings (
@@ -441,11 +463,41 @@ CREATE TABLE IF NOT EXISTS public.app_settings (
 );
 
 -- ============================================================
--- SECTION 10: DATA FIXES
+-- SECTION 11: STRIPE CUSTOMERS TABLE
 -- ============================================================
 
--- 10.1 Create credit lots for users who have credits but no active lots
--- This ensures users can use their existing credits
+CREATE TABLE IF NOT EXISTS public.stripe_customers (
+  user_id uuid PRIMARY KEY REFERENCES public.users(id) ON DELETE CASCADE,
+  stripe_customer_id text NOT NULL UNIQUE
+);
+
+-- ============================================================
+-- SECTION 12: CREDIT PURCHASES TABLE
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS public.credit_purchases (
+  id serial PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  stripe_payment_intent text UNIQUE,
+  credits_added integer NOT NULL,
+  amount_usd_cents integer NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- ============================================================
+-- SECTION 13: ADDITIONAL INDEXES FOR PERFORMANCE
+-- ============================================================
+
+-- Users indexes
+CREATE INDEX IF NOT EXISTS idx_users_email_lower ON public.users(lower(email));
+CREATE INDEX IF NOT EXISTS idx_users_created_at ON public.users(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_users_google_id ON public.users(google_id) WHERE google_id IS NOT NULL;
+
+-- ============================================================
+-- SECTION 14: DATA FIXES
+-- ============================================================
+
+-- 14.1 Create credit lots for users who have credits but no active lots
 INSERT INTO public.credit_lots (user_id, source, amount, remaining, expires_at)
 SELECT
     u.id,
@@ -465,60 +517,41 @@ AND NOT EXISTS (
 ON CONFLICT DO NOTHING;
 
 -- ============================================================
--- SECTION 11: VERIFICATION
+-- SECTION 15: DEFAULT APP SETTINGS
 -- ============================================================
 
--- Display migration summary
-DO $$
-DECLARE
-    v_credit_lots_count integer;
-    v_credit_reservations_count integer;
-    v_outbox_count integer;
-    v_missing_columns text[];
-BEGIN
-    SELECT count(*) INTO v_credit_lots_count FROM public.credit_lots;
-    SELECT count(*) INTO v_credit_reservations_count FROM public.credit_reservations;
-    SELECT count(*) INTO v_outbox_count FROM public.outbox;
-
-    RAISE NOTICE '==========================================';
-    RAISE NOTICE 'MIGRATION COMPLETE - SUMMARY';
-    RAISE NOTICE '==========================================';
-    RAISE NOTICE 'credit_lots rows: %', v_credit_lots_count;
-    RAISE NOTICE 'credit_reservations rows: %', v_credit_reservations_count;
-    RAISE NOTICE 'outbox rows: %', v_outbox_count;
-    RAISE NOTICE '==========================================';
-END $$;
+INSERT INTO public.app_settings (key, value) VALUES
+  ('free_signup_credits_enabled', 'true'),
+  ('default_free_credits', '10')
+ON CONFLICT (key) DO NOTHING;
 
 COMMIT;
 
 -- ============================================================
--- POST-MIGRATION VERIFICATION QUERIES
--- Run these manually to verify the migration succeeded
+-- VERIFICATION QUERIES (run after migration)
 -- ============================================================
 
--- Check all required tables exist
-SELECT 'Tables Check' as check_type, table_name
+SELECT 'Tables' as check_type, count(*) as count
 FROM information_schema.tables
 WHERE table_schema = 'public'
-AND table_name IN ('credit_lots', 'credit_reservations', 'outbox', 'app_settings')
-ORDER BY table_name;
+AND table_type = 'BASE TABLE';
 
--- Check critical columns exist
-SELECT 'Columns Check' as check_type, table_name, column_name
+SELECT 'credit_lots' as table_name, count(*) as rows FROM public.credit_lots
+UNION ALL SELECT 'credit_reservations', count(*) FROM public.credit_reservations
+UNION ALL SELECT 'credit_transactions', count(*) FROM public.credit_transactions
+UNION ALL SELECT 'outbox', count(*) FROM public.outbox
+UNION ALL SELECT 'users', count(*) FROM public.users;
+
+SELECT 'Critical columns exist' as check_type,
+       table_name,
+       column_name
 FROM information_schema.columns
 WHERE table_schema = 'public'
 AND (
-    (table_name = 'credit_transactions' AND column_name IN ('lot_id', 'expires_at', 'reservation_id'))
+    (table_name = 'credit_transactions' AND column_name IN ('lot_id', 'reservation_id'))
     OR (table_name = 'subscriptions' AND column_name = 'billing_mode')
-    OR (table_name = 'generation_sessions' AND column_name IN ('guidance_scale', 'negative_prompt', 'seed', 'error_details', 'timing_breakdown', 'reservation_id'))
-    OR (table_name = 'video_generation_sessions' AND column_name IN ('resolution', 'video_duration', 'provider_status', 'storage_status', 'timing_breakdown', 'reservation_id'))
+    OR (table_name = 'outbox' AND column_name = 'processed_at')
+    OR (table_name = 'generation_sessions' AND column_name IN ('guidance_scale', 'reservation_id'))
+    OR (table_name = 'video_generation_sessions' AND column_name IN ('resolution', 'reservation_id'))
 )
 ORDER BY table_name, column_name;
-
--- Check indexes exist
-SELECT 'Indexes Check' as check_type, indexname
-FROM pg_indexes
-WHERE schemaname = 'public'
-AND indexname LIKE 'idx_credit_%'
-ORDER BY indexname
-LIMIT 10;
