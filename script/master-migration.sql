@@ -1135,7 +1135,7 @@ CREATE TABLE IF NOT EXISTS public.app_settings (
 SELECT safe_create_index('CREATE INDEX IF NOT EXISTS idx_app_settings_key ON app_settings(key)');
 
 -- Seed default settings
-INSERT INTO app_settings (key, value) VALUES ('free_signup_credits_enabled', 'true') ON CONFLICT (key) DO NOTHING;
+INSERT INTO app_settings (key, value) VALUES ('free_signup_credits_enabled', 'true'::jsonb) ON CONFLICT (key) DO NOTHING;
 
 -- ============================================================
 -- SECTION 26: ADMIN ACTIONS TABLE
@@ -1236,8 +1236,23 @@ CREATE TABLE IF NOT EXISTS public.subscription_plans (
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   sort_order INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (plan_key, billing_mode)
 );
+
+-- Add unique constraint if table already exists without it
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'subscription_plans'::regclass
+        AND contype = 'u'
+        AND conname LIKE '%plan_key%'
+    ) THEN
+        ALTER TABLE subscription_plans ADD CONSTRAINT ux_subscription_plans_plan_key_billing_mode UNIQUE (plan_key, billing_mode);
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Unique constraint already exists or cannot be added: %', SQLERRM;
+END $$;
 
 SELECT safe_create_index('CREATE UNIQUE INDEX IF NOT EXISTS ux_subscription_plans_key_mode ON subscription_plans (plan_key, billing_mode)');
 SELECT safe_create_index('CREATE INDEX IF NOT EXISTS idx_subscription_plans_stripe_price ON subscription_plans (stripe_price_id)');
@@ -1271,7 +1286,7 @@ ON CONFLICT (plan_key, billing_mode) DO NOTHING;
 -- Credit Packages
 CREATE TABLE IF NOT EXISTS public.credit_packages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  display_name TEXT NOT NULL,
+  display_name TEXT NOT NULL UNIQUE,
   credits INTEGER NOT NULL,
   price_cents INTEGER NOT NULL,
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -1280,18 +1295,25 @@ CREATE TABLE IF NOT EXISTS public.credit_packages (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Add unique constraint for existing tables
+DO $$ BEGIN
+    ALTER TABLE credit_packages ADD CONSTRAINT ux_credit_packages_display_name UNIQUE (display_name);
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Unique constraint already exists: %', SQLERRM;
+END $$;
+
 INSERT INTO credit_packages (display_name, credits, price_cents, sort_order)
 VALUES
   ('1000 Credits', 1000, 300, 1),
   ('2000 Credits', 2000, 500, 2),
   ('3000 Credits', 3000, 700, 3),
   ('4000 Credits', 4000, 900, 4)
-ON CONFLICT DO NOTHING;
+ON CONFLICT (display_name) DO NOTHING;
 
 -- Model Pricing
 CREATE TABLE IF NOT EXISTS public.model_pricing (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  model_key TEXT NOT NULL,
+  model_key TEXT NOT NULL UNIQUE,
   display_name TEXT NOT NULL,
   operation TEXT NOT NULL,
   unit TEXT NOT NULL,
@@ -1300,6 +1322,13 @@ CREATE TABLE IF NOT EXISTS public.model_pricing (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Add unique constraint for existing tables
+DO $$ BEGIN
+    ALTER TABLE model_pricing ADD CONSTRAINT ux_model_pricing_model_key UNIQUE (model_key);
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Unique constraint already exists: %', SQLERRM;
+END $$;
 
 SELECT safe_create_index('CREATE UNIQUE INDEX IF NOT EXISTS ux_model_pricing_model_key ON model_pricing(model_key)');
 
@@ -1311,7 +1340,7 @@ VALUES
   ('seedance-1-lite', 'Seedance 1.0 Lite', 'video', 'second', 1),
   ('veo-3-fast', 'Google Veo 3 Fast', 'video', 'second', 1),
   ('veo-3-quality', 'Google Veo 3 Quality', 'video', 'second', 1)
-ON CONFLICT DO NOTHING;
+ON CONFLICT (model_key) DO NOTHING;
 
 -- Video Variant Pricing
 CREATE TABLE IF NOT EXISTS public.video_variant_pricing (
