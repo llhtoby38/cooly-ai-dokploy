@@ -62,14 +62,14 @@ CREATE TABLE IF NOT EXISTS public.credit_reservations (
   session_id uuid,
   session_type text,
   amount integer NOT NULL CHECK (amount > 0),
-  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','captured','released')),
+  status text NOT NULL DEFAULT 'reserved' CHECK (status IN ('reserved','expired','captured','released')),
   created_at timestamptz NOT NULL DEFAULT now(),
   expires_at timestamptz NOT NULL DEFAULT (now() + interval '1 hour'),
   captured_at timestamptz,
   released_at timestamptz
 );
 
-CREATE INDEX IF NOT EXISTS idx_credit_reservations_user ON public.credit_reservations(user_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_credit_reservations_user ON public.credit_reservations(user_id) WHERE status = 'reserved';
 CREATE INDEX IF NOT EXISTS idx_credit_reservations_session ON public.credit_reservations(session_id);
 
 -- ============================================================

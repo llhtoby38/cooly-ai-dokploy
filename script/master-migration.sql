@@ -167,7 +167,7 @@ CREATE TABLE IF NOT EXISTS public.credit_reservations (
   session_id uuid,
   session_type text,
   amount integer NOT NULL DEFAULT 1,
-  status text NOT NULL DEFAULT 'pending',
+  status text NOT NULL DEFAULT 'reserved',
   created_at timestamptz NOT NULL DEFAULT now(),
   expires_at timestamptz NOT NULL DEFAULT (now() + interval '1 hour'),
   captured_at timestamptz,
@@ -181,24 +181,33 @@ DO $$ BEGIN
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 
--- Fix data
+-- Fix data: convert invalid statuses
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='credit_reservations' AND column_name='status') THEN
-        UPDATE public.credit_reservations SET status = 'released' WHERE status IS NULL OR status NOT IN ('pending', 'captured', 'released');
+        -- Convert 'pending' to 'reserved' (old naming)
+        UPDATE public.credit_reservations SET status = 'reserved' WHERE status = 'pending';
+        -- Mark any other invalid statuses as released
+        UPDATE public.credit_reservations SET status = 'released' WHERE status IS NULL OR status NOT IN ('reserved', 'expired', 'captured', 'released');
     END IF;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 
--- Constraints (safe)
+-- Drop old constraint if exists (might have wrong values)
 DO $$ BEGIN
-    ALTER TABLE public.credit_reservations ADD CONSTRAINT credit_reservations_status_check CHECK (status IN ('pending','captured','released'));
+    ALTER TABLE public.credit_reservations DROP CONSTRAINT IF EXISTS credit_reservations_status_check;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 
--- Indexes (safe)
-SELECT safe_create_index('CREATE INDEX IF NOT EXISTS idx_credit_reservations_user ON public.credit_reservations(user_id) WHERE status = ''pending''');
+-- Add correct constraint (reserved, expired, captured, released)
+DO $$ BEGIN
+    ALTER TABLE public.credit_reservations ADD CONSTRAINT credit_reservations_status_check CHECK (status IN ('reserved','expired','captured','released'));
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+
+-- Indexes (safe) - use 'reserved' not 'pending'
+SELECT safe_create_index('CREATE INDEX IF NOT EXISTS idx_credit_reservations_user ON public.credit_reservations(user_id) WHERE status = ''reserved''');
 SELECT safe_create_index('CREATE INDEX IF NOT EXISTS idx_credit_reservations_session ON public.credit_reservations(session_id)');
-SELECT safe_create_index('CREATE INDEX IF NOT EXISTS idx_credit_reservations_expires ON public.credit_reservations(expires_at) WHERE status = ''pending''');
+SELECT safe_create_index('CREATE INDEX IF NOT EXISTS idx_credit_reservations_expires ON public.credit_reservations(expires_at) WHERE status = ''reserved''');
 
 -- Add FK from credit_transactions to credit_reservations
 DO $$ BEGIN
