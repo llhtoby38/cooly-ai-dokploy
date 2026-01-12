@@ -45,22 +45,57 @@ if (isLocalDb) {
 const pool = new Pool({
   connectionString,
   ssl: isLocalDb ? false : { rejectUnauthorized: false },
-  // Keep app-side pool small and responsive; actual multiplexing is at the external pooler
-  max: Number(process.env.PGPOOL_MAX || 10),
-  idleTimeoutMillis: Number(process.env.PGPOOL_IDLE_TIMEOUT_MS || 10000),
-  // Prefer shorter connect timeout with retry to fail fast and recover quickly
-  connectionTimeoutMillis: Number(process.env.PGPOOL_CONNECT_TIMEOUT_MS || 10000),
+  // Pool sizing: Account for LISTEN connections (3) + worker concurrency (5) + API headroom
+  // Default 20 provides room for: 3 LISTEN + 5 workers + 12 API/misc
+  max: Number(process.env.PGPOOL_MAX || 20),
+  // Longer idle timeout to prevent connection churn (30s default)
+  idleTimeoutMillis: Number(process.env.PGPOOL_IDLE_TIMEOUT_MS || 30000),
+  // Connection timeout with retry (15s gives more time for busy pools)
+  connectionTimeoutMillis: Number(process.env.PGPOOL_CONNECT_TIMEOUT_MS || 15000),
   // Help survive NAT/load balancers
-  keepAlive: true
+  keepAlive: true,
+  // Allow time for connections to become available (wait instead of fail)
+  allowExitOnIdle: false
 });
+
+// Pool metrics for diagnostics
+let poolStats = { acquired: 0, released: 0, errors: 0 };
+
+pool.on('acquire', () => { poolStats.acquired++; });
+pool.on('release', () => { poolStats.released++; });
+
+// Log pool status periodically in debug mode
+if (process.env.DEBUG_DB_POOL === 'true') {
+  setInterval(() => {
+    console.log('[db][pool] stats:', {
+      total: pool.totalCount,
+      idle: pool.idleCount,
+      waiting: pool.waitingCount,
+      acquired: poolStats.acquired,
+      released: poolStats.released,
+      errors: poolStats.errors
+    });
+  }, 30000).unref();
+}
 
 // Prevent unhandled errors (e.g. Supabase pooler restarts) from crashing the process
 pool.on('error', (err) => {
+  poolStats.errors++;
   try {
     // eslint-disable-next-line no-console
     console.warn('[db][pool] connection error', err?.message || err);
   } catch (_) {}
 });
+
+// Get pool stats for health checks
+function getPoolStats() {
+  return {
+    total: pool.totalCount,
+    idle: pool.idleCount,
+    waiting: pool.waitingCount,
+    ...poolStats
+  };
+}
 
 // Simple transient-error detection for acquire/connect/query paths
 function isTransientPgError(err) {
@@ -122,5 +157,7 @@ function getConnectionInfo() {
 module.exports = {
   query: (text, params) => withPgRetry(() => pool.query(text, params), 'query'),
   getClient: () => withPgRetry(() => pool.connect(), 'connect'),
-  getConnectionInfo
+  getConnectionInfo,
+  getPoolStats,
+  pool // Expose pool for advanced use cases (e.g., graceful shutdown)
 };
