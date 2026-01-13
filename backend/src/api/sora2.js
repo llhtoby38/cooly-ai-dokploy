@@ -56,9 +56,15 @@ function computeSizeString(aspectRatio, resolution) {
 }
 
 function computeWavespeedSize(aspectRatio, resolution) {
-  // Wavespeed expects width*height format
-  const size = computeSizeString(aspectRatio, resolution); // e.g., 1280x720
-  return size.replace('x', '*');
+  // Wavespeed only allows: 720*1280, 1280*720, 1024*1792, 1792*1024
+  const ar = String(aspectRatio || '').trim();
+  const isPortrait = ar === '9:16' || ar === '3:4' || ar === '2:3';
+  // For 16:9 or 9:16, use 720p sizes (Wavespeed doesn't support 1080p for these)
+  // For other aspect ratios, use 1024*1792 / 1792*1024
+  if (ar === '16:9') return '1280*720';
+  if (ar === '9:16') return '720*1280';
+  // Fallback to landscape/portrait based on aspect ratio
+  return isPortrait ? '1024*1792' : '1792*1024';
 }
 
 async function soraCreate(prompt, providerModel, aspectRatio, resolution, duration /*, imageUrl, startFrameUrl, endFrameUrl */) {
